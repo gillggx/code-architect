@@ -228,8 +228,18 @@ def create_app(debug: bool = False) -> FastAPI:
                 field="project_path",
             )
 
+        import hashlib
         job_id = str(uuid4())
-        project_id = request.project_id or f"project-{uuid4()}"
+        # Derive a stable project_id from the path so the same project
+        # always maps to the same memory_dir (enables incremental analysis).
+        if request.project_id:
+            project_id = request.project_id
+        else:
+            path_hash = hashlib.sha1(
+                os.path.abspath(request.project_path).encode()
+            ).hexdigest()[:12]
+            folder_name = os.path.basename(request.project_path.rstrip("/")) or "project"
+            project_id = f"{folder_name}-{path_hash}"
 
         # Register job so WS endpoint can track it
         async with _app_state._lock:
