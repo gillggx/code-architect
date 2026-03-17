@@ -9,6 +9,7 @@ import {
   FileNode,
   MemoryModule,
   AnalysisJob,
+  useChat,
 } from '../store/app';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -108,6 +109,8 @@ const TopBar: React.FC = () => {
   const setFilesTotal = useAppStore((s) => s.setFilesTotal);
   const incrementFilesAnalyzed = useAppStore((s) => s.incrementFilesAnalyzed);
   const resetProgress = useAppStore((s) => s.resetProgress);
+  const { addChatMessage, updateLastAssistantMessage, setChatStreaming } = useChat();
+  const chatSessionIdRef = useRef<string>(crypto.randomUUID());
 
   const [showModal, setShowModal] = useState(false);
   const [showBrowser, setShowBrowser] = useState(false);
@@ -254,6 +257,55 @@ const TopBar: React.FC = () => {
         if (event.type === 'done') {
           setCurrentJob({ ...job, status: 'complete' });
           ws.close();
+          // Auto-post summary to chat
+          const filesAnalyzed = (event.data?.files_analyzed as number) ?? 0;
+          const patternsFound = (event.data?.patterns_found as number) ?? 0;
+          const duration = (event.data?.duration_seconds as number) ?? 0;
+          const projectName = projectPath.split('/').filter(Boolean).pop() ?? projectPath;
+          addChatMessage({
+            id: crypto.randomUUID(),
+            role: 'assistant',
+            content: `✅ **Analysis complete** — ${projectName}\n${filesAnalyzed} files analyzed · ${patternsFound} patterns detected · ${duration.toFixed(1)}s\n\nAsk me anything about the architecture.`,
+          });
+          // Trigger LLM summary
+          const autoPrompt = `Summarize the key architectural findings from this analysis in 3-5 bullet points.`;
+          addChatMessage({ id: crypto.randomUUID(), role: 'user', content: autoPrompt });
+          setChatStreaming(true);
+          addChatMessage({ id: crypto.randomUUID(), role: 'assistant', content: '', streaming: true });
+          (async () => {
+            try {
+              const res = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: autoPrompt, project_id: projectId, session_id: chatSessionIdRef.current }),
+              });
+              if (res.ok) {
+                const reader = res.body?.getReader();
+                const decoder = new TextDecoder();
+                let buf = '';
+                while (reader) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  buf += decoder.decode(value, { stream: true });
+                  const lines = buf.split('\n');
+                  buf = lines.pop() ?? '';
+                  for (const line of lines) {
+                    const t = line.trim();
+                    if (!t.startsWith('data:')) continue;
+                    const raw = t.slice(5).trim();
+                    if (raw === '[DONE]') break;
+                    try {
+                      const p = JSON.parse(raw) as { delta?: string; text?: string; content?: string };
+                      const chunk = p.delta ?? p.text ?? p.content ?? '';
+                      if (chunk) updateLastAssistantMessage(chunk);
+                    } catch { if (raw) updateLastAssistantMessage(raw); }
+                  }
+                }
+              }
+            } finally {
+              setChatStreaming(false);
+            }
+          })();
         } else if (event.type === 'error') {
           setCurrentJob({ ...job, status: 'error' });
           ws.close();

@@ -262,8 +262,8 @@ class ModelRouter:
             'fallbacks': ['anthropic/claude-haiku-4-5', 'openai/gpt-4o'],
         },
         'complex': {
-            'primary': 'anthropic/claude-opus-4-5',
-            'fallbacks': ['anthropic/claude-sonnet-4-5', 'openai/gpt-4o'],
+            'primary': 'anthropic/claude-sonnet-4-5',
+            'fallbacks': ['anthropic/claude-haiku-4-5', 'openai/gpt-4o'],
         },
     }
     
