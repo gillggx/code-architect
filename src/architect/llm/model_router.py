@@ -86,10 +86,10 @@ class RoutingMetrics:
         """Average cost per query"""
         return self.total_cost / max(1, self.total_queries)
     
-    def local_model_ratio(self) -> float:
-        """Ratio of local model usage"""
-        local_queries = self.models_used.get('qwen:7b-chat', 0) + self.models_used.get('qwen:32b-chat', 0)
-        return local_queries / max(1, self.total_queries)
+    def haiku_ratio(self) -> float:
+        """Ratio of Haiku (fast/cheap) model usage"""
+        haiku_queries = self.models_used.get('anthropic/claude-haiku-4-5', 0)
+        return haiku_queries / max(1, self.total_queries)
     
     def summary(self) -> Dict:
         """Get summary statistics"""
@@ -99,7 +99,7 @@ class RoutingMetrics:
             'models_used': self.models_used,
             'total_cost': f"${self.total_cost:.2f}",
             'avg_cost_per_query': f"${self.cost_per_query():.4f}",
-            'local_model_ratio': f"{self.local_model_ratio():.1%}",
+            'haiku_ratio': f"{self.haiku_ratio():.1%}",
             'fallback_count': self.fallback_count,
         }
 
@@ -210,59 +210,60 @@ class ModelRouter:
     Estimated savings: 49% vs all-cloud
     """
     
-    # Model registry
+    # Model registry — all via OpenRouter
     MODELS: Dict[str, ModelConfig] = {
-        'qwen:7b-chat': ModelConfig(
-            name='qwen:7b-chat',
-            provider='ollama',
-            context_window=4096,
+        'anthropic/claude-sonnet-4-5': ModelConfig(
+            name='anthropic/claude-sonnet-4-5',
+            provider='openrouter',
+            context_window=200000,
+            latency_target_ms=2000,
+            cost_per_1k_tokens=0.003,
+            deployment='cloud',
+            max_tokens=4096
+        ),
+        'anthropic/claude-opus-4-5': ModelConfig(
+            name='anthropic/claude-opus-4-5',
+            provider='openrouter',
+            context_window=200000,
+            latency_target_ms=4000,
+            cost_per_1k_tokens=0.015,
+            deployment='cloud',
+            max_tokens=4096
+        ),
+        'anthropic/claude-haiku-4-5': ModelConfig(
+            name='anthropic/claude-haiku-4-5',
+            provider='openrouter',
+            context_window=200000,
             latency_target_ms=1000,
-            cost_per_1k_tokens=0.0,
-            deployment='local',
-            max_tokens=2048
+            cost_per_1k_tokens=0.00025,
+            deployment='cloud',
+            max_tokens=4096
         ),
-        'qwen:32b-chat': ModelConfig(
-            name='qwen:32b-chat',
-            provider='ollama',
-            context_window=32768,
+        'openai/gpt-4o': ModelConfig(
+            name='openai/gpt-4o',
+            provider='openrouter',
+            context_window=128000,
             latency_target_ms=3000,
-            cost_per_1k_tokens=0.0,
-            deployment='local',
-            max_tokens=4096
-        ),
-        'llama-2-70b': ModelConfig(
-            name='llama-2-70b-chat-hf',
-            provider='together.ai',
-            context_window=4096,
-            latency_target_ms=8000,
-            cost_per_1k_tokens=0.0008,  # $0.80 per million tokens
+            cost_per_1k_tokens=0.005,
             deployment='cloud',
             max_tokens=4096
-        ),
-        'gpt-4': ModelConfig(
-            name='gpt-4',
-            provider='openai',
-            context_window=8192,
-            latency_target_ms=5000,
-            cost_per_1k_tokens=0.03,
-            deployment='cloud',
-            max_tokens=2048
         ),
     }
-    
-    # Routing rules by complexity
+
+    # Routing rules by complexity — all use Claude Sonnet as default
+    # Can be overridden via DEFAULT_LLM_MODEL env var in LLMClient
     ROUTING_RULES = {
         'simple': {
-            'primary': 'qwen:7b-chat',
-            'fallbacks': ['qwen:32b-chat'],
+            'primary': 'anthropic/claude-haiku-4-5',
+            'fallbacks': ['anthropic/claude-sonnet-4-5'],
         },
         'moderate': {
-            'primary': 'qwen:32b-chat',
-            'fallbacks': ['qwen:7b-chat', 'llama-2-70b'],
+            'primary': 'anthropic/claude-sonnet-4-5',
+            'fallbacks': ['anthropic/claude-haiku-4-5', 'openai/gpt-4o'],
         },
         'complex': {
-            'primary': 'qwen:32b-chat',
-            'fallbacks': ['llama-2-70b', 'gpt-4'],
+            'primary': 'anthropic/claude-opus-4-5',
+            'fallbacks': ['anthropic/claude-sonnet-4-5', 'openai/gpt-4o'],
         },
     }
     
@@ -444,14 +445,11 @@ class IntelligentDegradation:
             return None
         
         if reason == 'timeout':
-            # Try fallback with local models first
-            fallbacks = ['qwen:7b-chat', 'qwen:32b-chat']
+            fallbacks = ['anthropic/claude-haiku-4-5', 'anthropic/claude-sonnet-4-5']
         elif reason == 'rate_limit':
-            # Use cheaper model
-            fallbacks = ['qwen:7b-chat']
+            fallbacks = ['anthropic/claude-haiku-4-5']
         else:  # error
-            # Use local models
-            fallbacks = ['qwen:32b-chat', 'qwen:7b-chat']
+            fallbacks = ['anthropic/claude-sonnet-4-5', 'anthropic/claude-haiku-4-5']
         
         # Return first available
         for model in fallbacks:
