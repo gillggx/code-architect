@@ -1,0 +1,485 @@
+/**
+ * App layout styles — Code Architect Agent v2
+ */
+
+/* Reset + base */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  line-height: 1.5;
+  background: #fff;
+  color: #1f2937;
+}
+
+/* App shell */
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  background: #fff;
+  color: #1f2937;
+}
+
+.app.dark-mode {
+  background: #1a1a1a;
+  color: #e0e0e0;
+}
+
+/* ── TopBar ──────────────────────────────────────────── */
+.topbar {
+  height: 52px;
+  display: flex;
+  align-items: center;
+  padding: 0 1rem;
+  gap: 1rem;
+  background: #1a6fa8;
+  color: white;
+  flex-shrink: 0;
+  z-index: 10;
+}
+
+.topbar-logo {
+  font-size: 1.2rem;
+  flex-shrink: 0;
+}
+
+.topbar-title {
+  font-weight: 700;
+  font-size: 1rem;
+  flex-shrink: 0;
+}
+
+.topbar-project {
+  font-size: 0.82rem;
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
+.topbar-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.topbar-btn {
+  height: 32px;
+  padding: 0 0.85rem;
+  background: rgba(255, 255, 255, 0.18);
+  color: white;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 6px;
+  font-size: 0.82rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+
+.topbar-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.topbar-btn.analyze {
+  background: #fff;
+  color: #1a6fa8;
+  font-weight: 600;
+  border-color: #fff;
+}
+
+.topbar-btn.analyze:hover {
+  background: #e8f4fd;
+}
+
+/* ── Body — 3 panels ─────────────────────────────────── */
+.app-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* Left panel */
+.panel-left {
+  width: 260px;
+  flex-shrink: 0;
+  border-right: 1px solid #e0e0e0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  background: #fafafa;
+}
+
+.dark-mode .panel-left {
+  border-color: #333;
+  background: #212121;
+}
+
+/* Center panel */
+.panel-center {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+}
+
+.dark-mode .panel-center {
+  background: #1a1a1a;
+}
+
+/* Right panel */
+.panel-right {
+  width: 300px;
+  flex-shrink: 0;
+  border-left: 1px solid #e0e0e0;
+  overflow-y: auto;
+  background: #fafafa;
+}
+
+.dark-mode .panel-right {
+  border-color: #333;
+  background: #212121;
+}
+
+/* Panel headers */
+.panel-header {
+  padding: 0.6rem 1rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  border-bottom: 1px solid #e0e0e0;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  position: sticky;
+  top: 0;
+  background: inherit;
+  z-index: 2;
+}
+
+.dark-mode .panel-header {
+  border-color: #333;
+  color: #666;
+}
+
+.panel-header-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.4rem;
+}
+
+.panel-header-btn {
+  background: none;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  padding: 0.15rem 0.5rem;
+  cursor: pointer;
+  color: #666;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+
+.dark-mode .panel-header-btn {
+  border-color: #444;
+  color: #888;
+}
+
+.panel-header-btn:hover {
+  background: #eee;
+}
+
+.dark-mode .panel-header-btn:hover {
+  background: #2a2a2a;
+}
+
+/* ── ChatBar ─────────────────────────────────────────── */
+.chatbar {
+  height: 80px;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-top: 1px solid #e0e0e0;
+  background: #fafafa;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.dark-mode .chatbar {
+  border-color: #333;
+  background: #222;
+}
+
+.chatbar-context {
+  font-size: 0.75rem;
+  color: #888;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.dark-mode .chatbar-context {
+  color: #666;
+}
+
+.chatbar-input {
+  flex: 1;
+  height: 48px;
+  border: 1px solid #ccc;
+  border-radius: 10px;
+  padding: 0 1rem;
+  font-size: 0.92rem;
+  font-family: inherit;
+  background: #fff;
+  color: #1f2937;
+}
+
+.dark-mode .chatbar-input {
+  background: #2a2a2a;
+  border-color: #444;
+  color: #eee;
+}
+
+.chatbar-input:focus {
+  outline: none;
+  border-color: #1a6fa8;
+}
+
+.chatbar-btn {
+  height: 48px;
+  padding: 0 1.4rem;
+  background: #1a6fa8;
+  color: white;
+  border: none;
+  border-radius: 10px;
+  font-size: 0.92rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+
+.chatbar-btn:hover {
+  background: #155e8f;
+}
+
+.chatbar-btn:disabled {
+  background: #aaa;
+  cursor: default;
+}
+
+.chatbar-btn.stop {
+  background: #c0392b;
+}
+
+.chatbar-btn.stop:hover {
+  background: #a93226;
+}
+
+.chatbar-icon-btn {
+  height: 48px;
+  width: 48px;
+  background: none;
+  border: 1px solid #ccc;
+  border-radius: 10px;
+  font-size: 1.1rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+
+.dark-mode .chatbar-icon-btn {
+  border-color: #444;
+  color: #ccc;
+}
+
+.chatbar-icon-btn:hover {
+  background: #e8f4fd;
+}
+
+.dark-mode .chatbar-icon-btn:hover {
+  background: #2a2a2a;
+}
+
+.chatbar-icon-btn.active {
+  background: #e8f4fd;
+  border-color: #1a6fa8;
+  color: #1a6fa8;
+}
+
+/* ── Modal overlay ───────────────────────────────────── */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: #fff;
+  border-radius: 12px;
+  padding: 1.5rem;
+  width: 440px;
+  max-width: 90vw;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+}
+
+.dark-mode .modal {
+  background: #2a2a2a;
+  color: #e0e0e0;
+}
+
+.modal h2 {
+  font-size: 1rem;
+  margin-bottom: 1rem;
+}
+
+.modal-input {
+  width: 100%;
+  height: 44px;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  padding: 0 0.9rem;
+  font-size: 0.9rem;
+  font-family: inherit;
+  margin-bottom: 1rem;
+}
+
+.dark-mode .modal-input {
+  background: #333;
+  border-color: #555;
+  color: #e0e0e0;
+}
+
+.modal-input:focus {
+  outline: none;
+  border-color: #1a6fa8;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.modal-btn {
+  height: 38px;
+  padding: 0 1.2rem;
+  border-radius: 8px;
+  font-size: 0.88rem;
+  cursor: pointer;
+  border: 1px solid #ccc;
+  background: #f5f5f5;
+}
+
+.modal-btn.primary {
+  background: #1a6fa8;
+  color: white;
+  border-color: #1a6fa8;
+}
+
+.modal-btn.primary:hover {
+  background: #155e8f;
+}
+
+.dark-mode .modal-btn {
+  background: #3a3a3a;
+  border-color: #555;
+  color: #e0e0e0;
+}
+
+.modal-error {
+  color: #c0392b;
+  font-size: 0.82rem;
+  margin-bottom: 0.75rem;
+}
+
+/* ── Utilities ───────────────────────────────────────── */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem 1.5rem;
+  color: #aaa;
+  text-align: center;
+  gap: 0.5rem;
+  flex: 1;
+}
+
+.empty-state-icon {
+  font-size: 2.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.empty-state-text {
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  background: #e8f4fd;
+  color: #1a6fa8;
+}
+
+.dark-mode .badge {
+  background: #1a3a52;
+  color: #7ab8d8;
+}
+
+.badge.pattern {
+  background: #e8f5f0;
+  color: #1a7a4a;
+}
+
+.dark-mode .badge.pattern {
+  background: #1a3a2a;
+  color: #7ab898;
+}
+
+/* Spinner */
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: white;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
