@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from ..llm.client import LLMClient
+from ..memory.incremental_analysis import ChangeDetector, ProjectSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -213,12 +214,19 @@ class LLMAnalyzer:
     # Public entry-point
     # ------------------------------------------------------------------
 
-    async def analyze_project(self, project_path: str) -> AnalysisSummary:
+    async def analyze_project(
+        self,
+        project_path: str,
+        memory_dir: Optional[str] = None,
+    ) -> AnalysisSummary:
         """
         Analyse an entire project directory.
 
         Args:
             project_path: Absolute (or relative) path to the project root.
+            memory_dir: Directory for Tier-2 memory / snapshots. When provided,
+                        incremental analysis is enabled — only changed/new files
+                        are re-analysed.
 
         Returns:
             AnalysisSummary with aggregated stats and module list.
@@ -240,18 +248,42 @@ class LLMAnalyzer:
             data={"total": files_scanned},
         ))
 
+        # --- 1b. Incremental: load old snapshot, detect changes ---
+        detector = ChangeDetector()
+        old_snapshot: Optional[ProjectSnapshot] = None
+        if memory_dir:
+            old_snapshot = await detector.load_snapshot(memory_dir)
+            if old_snapshot:
+                new_snapshot = await detector.snapshot_project(project_path)
+                changed, added, deleted = detector.diff_snapshots(old_snapshot, new_snapshot)
+                change_desc = detector.describe_changes(changed, added, deleted)
+                await self._emit(AgentEvent(
+                    type="scan",
+                    message=f"Incremental mode: {change_desc} since last analysis.",
+                    data={"changed": len(changed), "added": len(added), "deleted": len(deleted)},
+                ))
+                # Emit skip events for unchanged files (carry over previous summaries)
+                unchanged = set(old_snapshot.file_snapshots.keys()) - set(changed) - set(deleted)
+                for fp in sorted(unchanged):
+                    rel = os.path.relpath(fp, project_path)
+                    await self._emit(AgentEvent(type="skip", message=f"Unchanged: {rel}", file=rel))
+                # Only analyse changed + new files
+                files_to_analyze = set(changed + added)
+                all_files = [f for f in all_files if f in files_to_analyze]
+                files_scanned = len(all_files)  # update count for progress
+
         # --- 2. Prioritise ---
         priority_files = self._prioritize_files(all_files)
-        files_skipped = files_scanned - len(priority_files)
+        files_skipped_priority = files_scanned - len(priority_files)
 
-        if files_skipped > 0:
+        if files_skipped_priority > 0:
             await self._emit(AgentEvent(
                 type="skip",
                 message=(
-                    f"Skipping {files_skipped} lower-priority files "
+                    f"Skipping {files_skipped_priority} lower-priority files "
                     f"(keeping top {len(priority_files)})."
                 ),
-                data={"skipped": files_skipped},
+                data={"skipped": files_skipped_priority},
             ))
 
         # --- 3. Analyse each file ---
@@ -279,13 +311,21 @@ class LLMAnalyzer:
             data={"files_stored": len(self._memory)},
         ))
 
+        # --- 4b. Save snapshot for incremental analysis next time ---
+        if memory_dir:
+            try:
+                new_snap = await detector.snapshot_project(project_path)
+                await detector.save_snapshot(new_snap, memory_dir)
+            except Exception as exc:
+                logger.warning("Failed to save snapshot: %s", exc)
+
         duration = time.monotonic() - start_time
 
         summary = AnalysisSummary(
             project_path=project_path,
             files_scanned=files_scanned,
             files_analyzed=len(modules),
-            files_skipped=files_skipped,
+            files_skipped=files_skipped_priority,
             modules=modules,
             all_patterns=unique_patterns,
             duration_seconds=round(duration, 2),

@@ -112,6 +112,7 @@ const TopBar: React.FC = () => {
   const [showModal, setShowModal] = useState(false);
   const [showBrowser, setShowBrowser] = useState(false);
   const [inputPath, setInputPath] = useState('');
+  const [picking, setPicking] = useState(false);
   const [scanInfo, setScanInfo] = useState<{ total: number; analyzable: number } | null>(null);
   const [scanning, setScanning] = useState(false);
   const [modalError, setModalError] = useState('');
@@ -185,7 +186,7 @@ const TopBar: React.FC = () => {
       allPatternsRef.current = [];
       setFileTree([]);
       setPatterns([]);
-      if (scanInfo) setFilesTotal(scanInfo.analyzable);
+      if (scanInfo) setFilesTotal(Math.min(scanInfo.analyzable, 40));
 
       setSelectedProject({ path: projectPath, id: projectId });
       setShowModal(false);
@@ -309,8 +310,28 @@ const TopBar: React.FC = () => {
                 onKeyDown={(e) => { if (e.key === 'Enter') handleAnalyze(); if (e.key === 'Escape') setShowModal(false); }}
                 autoFocus
               />
-              <button className="modal-btn browse-btn" onClick={() => setShowBrowser(!showBrowser)}>
-                📁 Browse
+              <button
+                className="modal-btn browse-btn"
+                disabled={picking}
+                onClick={async () => {
+                  setPicking(true);
+                  try {
+                    const res = await fetch('/api/native-pick');
+                    if (res.ok) {
+                      const d = await res.json();
+                      if (d.path) setInputPath(d.path);
+                    } else {
+                      // fallback to web browser
+                      setShowBrowser(!showBrowser);
+                    }
+                  } catch {
+                    setShowBrowser(!showBrowser);
+                  } finally {
+                    setPicking(false);
+                  }
+                }}
+              >
+                {picking ? '…' : '📁 Choose Folder'}
               </button>
             </div>
 

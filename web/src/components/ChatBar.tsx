@@ -80,6 +80,7 @@ const ChatBar: React.FC = () => {
   const [overlayOpen, setOverlayOpen] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const sessionIdRef = useRef<string>(crypto.randomUUID());
 
   const projectName = selectedProject
     ? selectedProject.path.split('/').filter(Boolean).pop() ?? selectedProject.path
@@ -114,7 +115,7 @@ const ChatBar: React.FC = () => {
         body: JSON.stringify({
           message: text,
           project_id: selectedProject?.id ?? null,
-          stream: true,
+          session_id: sessionIdRef.current,
         }),
         signal: ctrl.signal,
       });

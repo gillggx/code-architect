@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from uuid import uuid4
 
-from fastapi import FastAPI, Request, WebSocket, Depends, status
+from fastapi import FastAPI, HTTPException, Request, WebSocket, Depends, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -263,8 +263,14 @@ def create_app(debug: bool = False) -> FastAPI:
                 async with _app_state._lock:
                     _app_state.active_jobs[job_id]["status"] = "running"
 
+                memory_dir = os.path.join(
+                    "architect_memory", project_id
+                )
                 analyzer = create_llm_analyzer(on_event=on_event)
-                summary = await analyzer.analyze_project(request.project_path)
+                summary = await analyzer.analyze_project(
+                    request.project_path,
+                    memory_dir=memory_dir,
+                )
 
                 async with _app_state._lock:
                     _app_state.active_jobs[job_id]["status"] = "complete"
@@ -671,6 +677,37 @@ def create_app(debug: bool = False) -> FastAPI:
                 if os.path.splitext(f)[1].lower() in SOURCE_EXTENSIONS:
                     analyzable += 1
         return {"total_files": total, "analyzable_files": analyzable, "path": abs_path}
+
+    @app.get("/api/native-pick", tags=["filesystem"], summary="Open native OS folder picker")
+    async def native_pick_folder() -> dict:
+        """
+        Trigger a native macOS Finder folder-picker dialog on the server.
+        Returns the selected path, or null if the user cancelled.
+        """
+        import subprocess
+        import sys
+
+        if sys.platform != "darwin":
+            raise HTTPException(status_code=501, detail="Native picker only supported on macOS")
+
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", "POSIX path of (choose folder)"],
+                capture_output=True,
+                text=True,
+                timeout=120,  # user has 2 min to pick
+            )
+            if result.returncode == 0:
+                chosen = result.stdout.strip()
+                # osascript appends a trailing slash — normalise
+                return {"path": chosen.rstrip("/")}
+            else:
+                # User pressed Cancel
+                return {"path": None}
+        except subprocess.TimeoutExpired:
+            return {"path": None}
+        except FileNotFoundError:
+            raise HTTPException(status_code=500, detail="osascript not found")
 
     # ========================================================================
     # WebSocket Endpoint
