@@ -295,8 +295,9 @@ const TopBar: React.FC = () => {
                     const raw = t.slice(5).trim();
                     if (raw === '[DONE]') break;
                     try {
-                      const p = JSON.parse(raw) as { delta?: string; text?: string; content?: string };
-                      const chunk = p.delta ?? p.text ?? p.content ?? '';
+                      const p = JSON.parse(raw) as { type?: string; data?: string; delta?: string; text?: string; content?: string };
+                      if (p.type === 'done') break;
+                      const chunk = p.data ?? p.delta ?? p.text ?? p.content ?? '';
                       if (chunk) updateLastAssistantMessage(chunk);
                     } catch { if (raw) updateLastAssistantMessage(raw); }
                   }

@@ -156,6 +156,65 @@ body {
   background: #212121;
 }
 
+/* Panel tabs */
+.panel-tabs {
+  padding: 0 !important;
+  display: flex;
+  align-items: stretch;
+}
+
+.tab-group {
+  display: flex;
+}
+
+.panel-tab {
+  background: none;
+  border: none;
+  border-bottom: 3px solid transparent;
+  padding: 0.7rem 1.25rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #aaa;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.panel-tab:hover { color: #555; }
+
+.panel-tab.active {
+  color: #1a6fa8;
+  border-bottom-color: #1a6fa8;
+}
+
+.dark-mode .panel-tab { color: #555; }
+.dark-mode .panel-tab:hover { color: #aaa; }
+.dark-mode .panel-tab.active { color: #4a9fd4; border-bottom-color: #4a9fd4; }
+
+.tab-badge {
+  background: #e0e0e0;
+  color: #666;
+  border-radius: 10px;
+  font-size: 0.65rem;
+  padding: 0.05rem 0.4rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.dark-mode .tab-badge { background: #333; color: #888; }
+
+.panel-tab.active .tab-badge {
+  background: #dceefa;
+  color: #1a6fa8;
+}
+
+.dark-mode .panel-tab.active .tab-badge { background: #1a3a52; color: #4a9fd4; }
+
 /* Panel headers */
 .panel-header {
   padding: 0.6rem 1rem;

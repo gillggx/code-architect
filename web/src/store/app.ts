@@ -120,6 +120,10 @@ interface AppStore {
   // UI
   darkMode: boolean;
   setDarkMode: (v: boolean) => void;
+
+  // Center panel tab
+  centerTab: 'activity' | 'chat';
+  setCenterTab: (tab: 'activity' | 'chat') => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +205,10 @@ export const useAppStore = create<AppStore>((set) => ({
   // UI
   darkMode: false,
   setDarkMode: (v) => set({ darkMode: v }),
+
+  // Center panel tab
+  centerTab: 'activity',
+  setCenterTab: (tab) => set({ centerTab: tab }),
 }));
 
 // ---------------------------------------------------------------------------

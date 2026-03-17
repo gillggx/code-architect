@@ -354,20 +354,7 @@
 
 /* ── ChatBar / ChatOverlay ───────────────────────────── */
 
-.chat-overlay {
-  position: fixed;
-  top: 0;
-  right: 0;
-  width: 420px;
-  height: 100vh;
-  background: #fff;
-  border-left: 1px solid #e0e0e0;
-  box-shadow: -4px 0 24px rgba(0, 0, 0, 0.10);
-  display: flex;
-  flex-direction: column;
-  z-index: 100;
-  overflow: hidden;
-}
+/* chat-overlay removed — chat is now a tab in the center panel */
 
 .dark-mode .chat-overlay {
   background: #222;
