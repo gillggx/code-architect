@@ -500,6 +500,10 @@ class GenerateRequest(BaseModel):
         None,
         description="Recent chat messages [{role, content}] for agent context",
     )
+    shell_unrestricted: bool = Field(
+        False,
+        description="Bypass shell command allowlist (dev only)",
+    )
 
 
 class FileChangeSchema(BaseModel):

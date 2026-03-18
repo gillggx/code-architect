@@ -26,6 +26,7 @@ const ChatBar: React.FC = () => {
   const isAnalyzing = currentJob?.status === 'running';
 
   const [inputValue, setInputValue] = useState('');
+  const [shellUnrestricted, setShellUnrestricted] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const sessionIdRef = useRef<string>(crypto.randomUUID());
   const [isAgentRunning, setIsAgentRunning] = useState(false);
@@ -144,6 +145,7 @@ const ChatBar: React.FC = () => {
           project_id: selectedProject.id,
           mode: 'interactive',
           chat_history: historyToSend,
+          shell_unrestricted: shellUnrestricted,
         }),
         signal: ctrl.signal,
       });
@@ -331,6 +333,16 @@ const ChatBar: React.FC = () => {
         disabled={isBusy || isAnalyzing}
         title={isAnalyzing ? 'Please wait for analysis to complete' : undefined}
       />
+
+      {editMode && (
+        <button
+          className={`chatbar-unrestricted-btn${shellUnrestricted ? ' active' : ''}`}
+          onClick={() => setShellUnrestricted(v => !v)}
+          title={shellUnrestricted ? 'Shell unrestricted (click to restrict)' : 'Shell restricted — click to allow all commands'}
+        >
+          {shellUnrestricted ? '🔓' : '🔒'}
+        </button>
+      )}
 
       {isBusy ? (
         <button className="chatbar-btn stop" onClick={handleStop}>Stop</button>

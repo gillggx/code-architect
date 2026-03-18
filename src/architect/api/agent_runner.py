@@ -359,6 +359,7 @@ class AgentRunner:
         context: Optional[str] = None,
         session_id: Optional[str] = None,
         chat_history: Optional[List[Dict[str, str]]] = None,
+        shell_unrestricted: bool = False,
     ) -> None:
         self.task = task
         self.project_path = project_path
@@ -367,6 +368,7 @@ class AgentRunner:
         self.context = context
         self.session_id = session_id or str(uuid4())
         self.chat_history: List[Dict[str, str]] = chat_history or []
+        self.shell_unrestricted = shell_unrestricted
 
         self._changes: List[FileChange] = []
         self._plan: List[str] = []
@@ -1100,7 +1102,7 @@ Now generate the real plan for the task above. You may include plan_b if there i
                 if self.mode == "dry_run":
                     return f"[dry_run] Would run: {cmd}", None
 
-                result = run_command(cmd, pp, timeout=timeout)
+                result = run_command(cmd, pp, timeout=timeout, shell_unrestricted=self.shell_unrestricted)
                 output = (
                     f"returncode: {result['returncode']}\n"
                     f"stdout:\n{result['stdout']}\n"

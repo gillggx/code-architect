@@ -795,6 +795,7 @@ def create_app(debug: bool = False) -> FastAPI:
                 context=request.context,
                 session_id=session_id,
                 chat_history=request.chat_history or [],
+                shell_unrestricted=request.shell_unrestricted,
             )
 
             async def sse_stream():
@@ -817,6 +818,7 @@ def create_app(debug: bool = False) -> FastAPI:
             mode=request.mode,
             context=request.context,
             chat_history=request.chat_history or [],
+            shell_unrestricted=request.shell_unrestricted,
         )
 
         explanation = ""
