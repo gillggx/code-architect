@@ -35,7 +35,6 @@ logger = logging.getLogger(__name__)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 AGENT_MODEL = os.getenv("DEFAULT_LLM_MODEL", "anthropic/claude-sonnet-4-5")
-MAX_ITERATIONS = 40
 CHUNK_SIZE = 12  # Max plan steps per execution phase
 APPROVAL_TIMEOUT = 300  # 5 minutes
 
@@ -785,9 +784,11 @@ Now generate the real plan for the task above. You may include plan_b if there i
             messages.append({"role": "user", "content": task_with_plan})
 
             chunk_completed = False
+            iteration = 0
 
-            for iteration in range(MAX_ITERATIONS):
-                logger.info("Phase %d/%d iteration %d/%d", chunk_idx + 1, total_chunks, iteration + 1, MAX_ITERATIONS)
+            while True:
+                iteration += 1
+                logger.info("Phase %d/%d iteration %d", chunk_idx + 1, total_chunks, iteration)
 
                 # Check if session was stopped
                 if self._session and self._session.status == "stopped":
@@ -951,19 +952,6 @@ Now generate the real plan for the task above. You may include plan_b if there i
                         diff=file_change.diff if file_change else None,
                     )
 
-            # Chunk hit MAX_ITERATIONS — continue to next chunk with summary
-            if not chunk_completed:
-                prev_summary = f"Completed {len(self._changes)} file changes so far (hit iteration limit on phase {chunk_idx + 1})."
-                if chunk_idx == total_chunks - 1:
-                    yield ToolCallEvent(
-                        type="done",
-                        content=f"Reached maximum iterations ({MAX_ITERATIONS}).",
-                        changes=self._changes,
-                        summary=f"Completed {len(self._changes)} file changes.",
-                    )
-                    if self._session:
-                        self._session.status = "complete"
-                    return
 
     def _compute_preview_diff(self, fn_name: str, fn_args: Dict[str, Any]) -> str:
         """Compute a preview diff for write_file / edit_file without writing to disk."""
