@@ -220,6 +220,9 @@ const TopBar: React.FC = () => {
       setInputPath('');
       setScanInfo(null);
 
+      // Reset counter when live analysis starts (don't carry over loaded memory count)
+      setFilesAnalyzed(0);
+
       const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
       const ws = new WebSocket(`${wsProtocol}://${window.location.host}/ws/analyze/${jobId}`);
       const job: AnalysisJob = { jobId, projectId, projectPath, status: 'running', ws };
