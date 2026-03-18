@@ -92,7 +92,6 @@ CONFIG_NAMES: frozenset[str] = frozenset({
     ".env.example",
     "requirements.txt",
     "Pipfile",
-    "poetry.lock",
     "go.mod",
     "Cargo.toml",
     "pom.xml",
@@ -152,6 +151,29 @@ LANGUAGE_MAP: dict[str, str] = {
     ".json": "JSON",
     ".md": "Markdown",
 }
+
+# ---------------------------------------------------------------------------
+# Auto-generated / lock files to skip (no architectural value, often huge)
+# ---------------------------------------------------------------------------
+
+SKIP_FILES: frozenset[str] = frozenset({
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "pnpm-lock.yml",
+    "poetry.lock",
+    "Pipfile.lock",
+    "Cargo.lock",
+    "go.sum",
+    "composer.lock",
+    "Gemfile.lock",
+    "mix.lock",
+    ".DS_Store",
+    "*.min.js",
+    "*.min.css",
+    "*.bundle.js",
+    "*.chunk.js",
+})
 
 MAX_FILES = None  # No limit — analyze all files
 MAX_CONTENT_CHARS = 8_000
@@ -439,6 +461,8 @@ class LLMAnalyzer:
             dirpath = Path(dirpath_str)
 
             for filename in filenames:
+                if filename in SKIP_FILES:
+                    continue
                 file_path = dirpath / filename
                 suffix = file_path.suffix.lower()
                 if suffix in SOURCE_EXTENSIONS:
