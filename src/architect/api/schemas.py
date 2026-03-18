@@ -504,6 +504,10 @@ class GenerateRequest(BaseModel):
         False,
         description="Bypass shell command allowlist (dev only)",
     )
+    auto_approve: bool = Field(
+        False,
+        description="Auto-apply all file changes without asking for approval",
+    )
 
 
 class FileChangeSchema(BaseModel):

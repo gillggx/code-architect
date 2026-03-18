@@ -27,6 +27,7 @@ const ChatBar: React.FC = () => {
 
   const [inputValue, setInputValue] = useState('');
   const [shellUnrestricted, setShellUnrestricted] = useState(false);
+  const [autoApprove, setAutoApprove] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const sessionIdRef = useRef<string>(crypto.randomUUID());
   const [isAgentRunning, setIsAgentRunning] = useState(false);
@@ -146,6 +147,7 @@ const ChatBar: React.FC = () => {
           mode: 'interactive',
           chat_history: historyToSend,
           shell_unrestricted: shellUnrestricted,
+          auto_approve: autoApprove,
         }),
         signal: ctrl.signal,
       });
@@ -335,13 +337,22 @@ const ChatBar: React.FC = () => {
       />
 
       {editMode && (
-        <button
-          className={`chatbar-unrestricted-btn${shellUnrestricted ? ' active' : ''}`}
-          onClick={() => setShellUnrestricted(v => !v)}
-          title={shellUnrestricted ? 'Shell unrestricted (click to restrict)' : 'Shell restricted — click to allow all commands'}
-        >
-          {shellUnrestricted ? '🔓' : '🔒'}
-        </button>
+        <>
+          <button
+            className={`chatbar-unrestricted-btn${autoApprove ? ' active' : ''}`}
+            onClick={() => setAutoApprove(v => !v)}
+            title={autoApprove ? 'Auto-approve ON — all file changes applied without asking (click to disable)' : 'Auto-approve OFF — will ask before each file change'}
+          >
+            {autoApprove ? '✅' : '👁'}
+          </button>
+          <button
+            className={`chatbar-unrestricted-btn${shellUnrestricted ? ' active' : ''}`}
+            onClick={() => setShellUnrestricted(v => !v)}
+            title={shellUnrestricted ? 'Shell unrestricted (click to restrict)' : 'Shell restricted — click to allow all commands'}
+          >
+            {shellUnrestricted ? '🔓' : '🔒'}
+          </button>
+        </>
       )}
 
       {isBusy ? (

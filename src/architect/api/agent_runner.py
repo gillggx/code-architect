@@ -360,6 +360,7 @@ class AgentRunner:
         session_id: Optional[str] = None,
         chat_history: Optional[List[Dict[str, str]]] = None,
         shell_unrestricted: bool = False,
+        auto_approve: bool = False,
     ) -> None:
         self.task = task
         self.project_path = project_path
@@ -369,6 +370,7 @@ class AgentRunner:
         self.session_id = session_id or str(uuid4())
         self.chat_history: List[Dict[str, str]] = chat_history or []
         self.shell_unrestricted = shell_unrestricted
+        self.auto_approve = auto_approve
 
         self._changes: List[FileChange] = []
         self._plan: List[str] = []
@@ -851,7 +853,7 @@ Now generate the real plan for the task above. You may include plan_b if there i
 
                     # For mutating tools in interactive mode: request approval
                     is_mutating = fn_name in ("write_file", "edit_file", "run_command")
-                    if self.mode == "interactive" and is_mutating and self._session:
+                    if self.mode == "interactive" and is_mutating and self._session and not self.auto_approve:
                         # Compute preview diff for file operations
                         preview_diff = ""
                         if fn_name in ("write_file", "edit_file"):
