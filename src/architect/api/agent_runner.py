@@ -36,6 +36,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 AGENT_MODEL = os.getenv("DEFAULT_LLM_MODEL", "anthropic/claude-sonnet-4-5")
 MAX_ITERATIONS = 40
+CHUNK_SIZE = 12  # Max plan steps per execution phase
 APPROVAL_TIMEOUT = 300  # 5 minutes
 
 
