@@ -15,32 +15,42 @@ from typing import Dict, Any, List
 # (anchored at start). Commands are validated after stripping leading whitespace.
 # ---------------------------------------------------------------------------
 ALLOWED_COMMANDS: List[str] = [
+    # Python test runners
     r"pytest(\s|$)",
     r"python\s+-m\s+pytest(\s|$)",
     r"python3\s+-m\s+pytest(\s|$)",
-    r"npm\s+test(\s|$)",
-    r"npm\s+run\s+test(\s|$)",
-    r"npm\s+run\s+lint(\s|$)",
-    r"npm\s+run\s+build(\s|$)",
-    r"npm\s+lint(\s|$)",
-    r"npm\s+build(\s|$)",
+    # Node test / lint / build (npm, yarn, pnpm, bun)
+    r"npm\s+(test|run\s+(test|lint|build|check|typecheck|format))(\s|$)",
+    r"yarn\s+(test|run\s+(test|lint|build|check|typecheck|format)|lint|build)(\s|$)",
+    r"pnpm\s+(test|run\s+(test|lint|build|check|typecheck|format)|lint|build)(\s|$)",
+    r"bun\s+(test|run\s+(test|lint|build))(\s|$)",
+    # Other language test runners
     r"cargo\s+test(\s|$)",
     r"go\s+test(\s|$)",
-    r"ruff\s+check(\s|$)",
+    # Linters / type checkers
     r"ruff(\s|$)",
     r"mypy(\s|$)",
-    r"git\s+status(\s|$)",
-    r"git\s+diff(\s|$)",
-    r"git\s+log(\s|$)",
+    r"eslint(\s|$)",
+    r"tsc(\s|$)",
+    r"pyright(\s|$)",
+    # Git read-only
+    r"git\s+(status|diff|log|show|blame)(\s|$)",
 ]
 
+# Commands allowed when prefixed with "cd <path> && <cmd>"
+_CD_PREFIX = re.compile(r"^cd\s+\S+\s*&&\s*(.+)$")
 _COMPILED: List[re.Pattern] = [re.compile(p) for p in ALLOWED_COMMANDS]
 
 
 def _is_allowed(cmd: str) -> bool:
-    """Return True if *cmd* matches at least one pattern in ALLOWED_COMMANDS."""
+    """Return True if *cmd* (or its cd-prefix variant) matches ALLOWED_COMMANDS."""
     stripped = cmd.strip()
-    return any(p.match(stripped) for p in _COMPILED)
+    # Strip optional "cd <path> && " prefix so agent can run commands in subdirs
+    m = _CD_PREFIX.match(stripped)
+    effective = m.group(1).strip() if m else stripped
+    # Also strip pipe suffixes like "| head -100" for matching purposes
+    effective_base = re.split(r"\s*[|;&]\s*", effective)[0].strip()
+    return any(p.match(effective_base) for p in _COMPILED)
 
 
 def run_command(

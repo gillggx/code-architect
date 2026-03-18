@@ -520,12 +520,29 @@ Rules:
                 temperature=0.3,
             )
             raw = response.choices[0].message.content or ""
-            # Extract JSON
+            # Extract JSON — find the outermost { } block robustly
             import re as _re
-            m = _re.search(r'\{.*\}', raw, _re.DOTALL)
-            if m:
-                data = json.loads(m.group(0))
+            data = None
+            # Try code-fence first: ```json ... ```
+            fence = _re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, _re.DOTALL)
+            if fence:
+                data = json.loads(fence.group(1))
             else:
+                # Walk char by char to find balanced { }
+                start = raw.find('{')
+                if start != -1:
+                    depth, end = 0, -1
+                    for i, ch in enumerate(raw[start:], start):
+                        if ch == '{':
+                            depth += 1
+                        elif ch == '}':
+                            depth -= 1
+                            if depth == 0:
+                                end = i
+                                break
+                    if end != -1:
+                        data = json.loads(raw[start:end + 1])
+            if data is None:
                 data = json.loads(raw)
 
             def _parse_plan(d: dict, variant: str) -> ExecutionPlan:
