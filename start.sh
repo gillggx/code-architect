@@ -3,8 +3,8 @@
 set -e
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BACKEND_PORT=8000
-FRONTEND_PORT=3000
+BACKEND_PORT=8001
+FRONTEND_PORT=3001
 
 echo "==> Killing old processes on ports $BACKEND_PORT and $FRONTEND_PORT..."
 lsof -ti :$BACKEND_PORT | xargs kill -9 2>/dev/null && echo "    Killed backend (port $BACKEND_PORT)" || echo "    No process on port $BACKEND_PORT"

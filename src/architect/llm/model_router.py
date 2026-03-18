@@ -248,6 +248,15 @@ class ModelRouter:
             deployment='cloud',
             max_tokens=4096
         ),
+        'openai/gpt-oss-120b': ModelConfig(
+            name='openai/gpt-oss-120b',
+            provider='openrouter',
+            context_window=128000,
+            latency_target_ms=3000,
+            cost_per_1k_tokens=0.0015,
+            deployment='cloud',
+            max_tokens=4096
+        ),
     }
 
     # Routing rules by complexity — all use Claude Sonnet as default
@@ -259,11 +268,11 @@ class ModelRouter:
         },
         'moderate': {
             'primary': 'anthropic/claude-sonnet-4-5',
-            'fallbacks': ['anthropic/claude-haiku-4-5', 'openai/gpt-4o'],
+            'fallbacks': ['openai/gpt-oss-120b', 'anthropic/claude-haiku-4-5', 'openai/gpt-4o'],
         },
         'complex': {
             'primary': 'anthropic/claude-sonnet-4-5',
-            'fallbacks': ['anthropic/claude-haiku-4-5', 'openai/gpt-4o'],
+            'fallbacks': ['openai/gpt-oss-120b', 'anthropic/claude-haiku-4-5', 'openai/gpt-4o'],
         },
     }
     

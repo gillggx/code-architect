@@ -1,9 +1,11 @@
 /**
  * FileTree — left panel showing analyzed project files with status icons.
+ *
+ * Modified files (touched by the edit agent) are marked with ●.
  */
 
 import React, { useState } from 'react';
-import { useFileTree, useJob, FileNode } from '../store/app';
+import { useFileTree, useJob, useAppStore, FileNode } from '../store/app';
 
 // ---------------------------------------------------------------------------
 // Status icon + color
@@ -25,7 +27,12 @@ const STATUS_COLOR: Record<FileNode['status'], string> = {
 // ---------------------------------------------------------------------------
 // Single file row
 // ---------------------------------------------------------------------------
-const FileRow: React.FC<{ node: FileNode }> = ({ node }) => {
+interface FileRowProps {
+  node: FileNode;
+  modified: boolean;
+}
+
+const FileRow: React.FC<FileRowProps> = ({ node, modified }) => {
   const [expanded, setExpanded] = useState(false);
 
   return (
@@ -42,6 +49,15 @@ const FileRow: React.FC<{ node: FileNode }> = ({ node }) => {
           {STATUS_ICON[node.status]}
         </span>
         <span className="file-name">{node.name}</span>
+        {modified && (
+          <span
+            className="file-modified-dot"
+            title="Modified by edit agent"
+            style={{ color: '#e67e22', marginLeft: 4 }}
+          >
+            ●
+          </span>
+        )}
         {node.summary && (
           <span className="file-expand-toggle">{expanded ? '▲' : '▼'}</span>
         )}
@@ -59,6 +75,7 @@ const FileRow: React.FC<{ node: FileNode }> = ({ node }) => {
 const FileTree: React.FC = () => {
   const { fileTree } = useFileTree();
   const { filesTotal, filesAnalyzed } = useJob();
+  const modifiedFiles = useAppStore(s => s.modifiedFiles);
 
   const total = fileTree.length;
   const pct = filesTotal > 0 ? Math.round((filesAnalyzed / filesTotal) * 100) : 0;
@@ -70,6 +87,15 @@ const FileTree: React.FC = () => {
         <span>📁 Files</span>
         {total > 0 && (
           <span style={{ fontWeight: 400, fontSize: '0.72rem' }}>({total})</span>
+        )}
+        {modifiedFiles.size > 0 && (
+          <span
+            className="file-modified-badge"
+            title={`${modifiedFiles.size} file(s) modified by edit agent`}
+            style={{ color: '#e67e22', fontSize: '0.72rem', marginLeft: 4 }}
+          >
+            ● {modifiedFiles.size} edited
+          </span>
         )}
       </div>
 
@@ -83,9 +109,15 @@ const FileTree: React.FC = () => {
       ) : (
         <>
           <div className="file-list">
-            {fileTree.map((node) => (
-              <FileRow key={node.path} node={node} />
-            ))}
+            {fileTree.map((node) => {
+              // Check if this file (or any child) is in modifiedFiles
+              const isModified = modifiedFiles.has(node.path) ||
+                modifiedFiles.has(node.name) ||
+                [...modifiedFiles].some(f => node.path.endsWith(f) || f.endsWith(node.name));
+              return (
+                <FileRow key={node.path} node={node} modified={isModified} />
+              );
+            })}
           </div>
           <div className="file-list-footer">
             {showProgress ? (

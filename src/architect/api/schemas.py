@@ -474,3 +474,164 @@ class A2AQueryResponse(BaseModel):
     )
     model_used: str = Field(description="LLM model used")
     query_type: str = Field(description="Query type echoed back")
+
+
+# ============================================================================
+# Code Edit Agent Schemas
+# ============================================================================
+
+class GenerateRequest(BaseModel):
+    """Request to generate / apply code changes via the edit agent.
+
+    Attributes:
+        task: Description of what to build or change.
+        project_id: Project context identifier.
+        mode: Execution mode — dry_run | apply | interactive.
+        context: Optional extra context for the agent.
+    """
+    task: str = Field(description="Task description", min_length=1)
+    project_id: str = Field(description="Project context ID")
+    mode: str = Field(
+        "dry_run",
+        description="Execution mode: dry_run | apply | interactive",
+    )
+    context: Optional[str] = Field(None, description="Additional context for agent")
+
+
+class FileChangeSchema(BaseModel):
+    """A single file change produced by the edit agent.
+
+    Attributes:
+        file: Relative file path.
+        action: create | edit | delete.
+        content: New file content.
+        diff: Unified diff string.
+        applied: Whether the change was written to disk.
+    """
+    file: str = Field(description="Relative file path")
+    action: str = Field(description="create | edit | delete")
+    content: Optional[str] = Field(None, description="New file content")
+    diff: Optional[str] = Field(None, description="Unified diff")
+    applied: bool = Field(False, description="Written to disk")
+
+
+class GenerateResponse(BaseModel):
+    """Response from the code generation agent.
+
+    Attributes:
+        changes: List of proposed / applied file changes.
+        plan: High-level plan steps.
+        explanation: Human-readable explanation of the changes.
+        patterns_used: Design patterns applied.
+        tests_suggested: Suggested test cases.
+        applied: Whether changes were applied to disk.
+        model_used: LLM model that generated the code.
+        session_id: Session ID for interactive mode.
+    """
+    changes: List[FileChangeSchema] = Field(
+        default_factory=list, description="File changes"
+    )
+    plan: List[str] = Field(default_factory=list, description="Plan steps")
+    explanation: str = Field("", description="Explanation of changes")
+    patterns_used: List[str] = Field(
+        default_factory=list, description="Patterns applied"
+    )
+    tests_suggested: List[str] = Field(
+        default_factory=list, description="Suggested tests"
+    )
+    applied: bool = Field(False, description="Changes applied to disk")
+    model_used: str = Field("", description="LLM model used")
+    session_id: Optional[str] = Field(None, description="Session ID for interactive mode")
+
+
+class ValidateRequest(BaseModel):
+    """Request to validate proposed code changes against project patterns.
+
+    Attributes:
+        project_id: Project context identifier.
+        changes: List of file changes to validate.
+    """
+    project_id: str = Field(description="Project ID")
+    changes: List[FileChangeSchema] = Field(description="Changes to validate")
+
+
+class ValidateResponse(BaseModel):
+    """Validation result for proposed code changes.
+
+    Attributes:
+        valid: Whether the changes are acceptable.
+        confidence: Confidence score (0–1).
+        issues: List of blocking issues.
+        warnings: List of non-blocking warnings.
+        patterns_matched: Patterns correctly used.
+        patterns_missing: Patterns expected but absent.
+    """
+    valid: bool = Field(description="Changes are acceptable")
+    confidence: float = Field(ge=0.0, le=1.0, description="Confidence score")
+    issues: List[str] = Field(default_factory=list, description="Blocking issues")
+    warnings: List[str] = Field(default_factory=list, description="Warnings")
+    patterns_matched: List[str] = Field(
+        default_factory=list, description="Patterns correctly used"
+    )
+    patterns_missing: List[str] = Field(
+        default_factory=list, description="Expected patterns absent"
+    )
+
+
+class ImpactRequest(BaseModel):
+    """Request for change impact analysis.
+
+    Attributes:
+        project_id: Project context identifier.
+        files: List of files being changed.
+        change_description: Description of the intended change.
+    """
+    project_id: str = Field(description="Project ID")
+    files: List[str] = Field(description="Files being changed")
+    change_description: str = Field(description="Description of the change")
+
+
+class ImpactResponse(BaseModel):
+    """Impact analysis response.
+
+    Attributes:
+        affected_files: Files affected by the change (with reason / risk).
+        risk: Overall risk level — low | medium | high.
+        confidence: Confidence score (0–1).
+        recommendation: Human-readable recommendation.
+    """
+    affected_files: List[Dict[str, Any]] = Field(
+        default_factory=list, description="Affected files with metadata"
+    )
+    risk: str = Field("low", description="Risk level: low | medium | high")
+    confidence: float = Field(ge=0.0, le=1.0, description="Confidence score")
+    recommendation: str = Field("", description="Human-readable recommendation")
+
+
+class ApproveRequest(BaseModel):
+    """Request to approve or reject a pending agent action.
+
+    Attributes:
+        session_id: Agent session identifier.
+        action: apply | skip | stop | edit.
+        edited_content: For action='edit', the modified file content.
+    """
+    session_id: str = Field(description="Agent session ID")
+    action: str = Field(
+        description="Decision: apply | skip | stop | edit",
+    )
+    edited_content: Optional[str] = Field(
+        None, description="Modified content (for action='edit')"
+    )
+
+
+class ApprovePlanRequest(BaseModel):
+    session_id: str
+    action: str  # "approve" | "reject" | "stop"
+    chosen_plan: Optional[str] = None  # "A" | "B"
+
+
+class EscalationRequest(BaseModel):
+    session_id: str
+    action: str  # "alternative" | "manual_fix" | "stop"
+    instruction: Optional[str] = None

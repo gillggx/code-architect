@@ -14,6 +14,7 @@ Memory is read-only here — it stores code analysis results, not chat logs.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import AsyncIterator, List, Optional, Dict, Any
@@ -73,6 +74,13 @@ class ChatEngine:
         self.router = model_router or create_model_router()
         self.rag = rag_integration
         self.memory = memory
+        # project_id → list of module dicts from LLM analysis
+        self._project_modules: Dict[str, List[Dict[str, Any]]] = {}
+
+    def update_project_context(self, project_id: str, modules: List[Dict[str, Any]]) -> None:
+        """Store analysis modules so they can be injected into chat context."""
+        self._project_modules[project_id] = modules
+        logger.info("ChatEngine: stored %d modules for project %s", len(modules), project_id)
 
     # ------------------------------------------------------------------
     # Public API
@@ -138,7 +146,12 @@ class ChatEngine:
             "patterns": [],
             "semantic_chunks": [],
             "keyword_hits": [],
+            "modules": [],
         }
+
+        # Inject stored LLM analysis modules for this project
+        if project_id and project_id in self._project_modules:
+            context["modules"] = self._project_modules[project_id]
 
         if not self.rag and not self.memory:
             return context
@@ -194,6 +207,19 @@ class ChatEngine:
 
         return messages
 
+    def _load_soul(self, project_id: Optional[str]) -> str:
+        """Load SOUL.md for the current project."""
+        from ..api.soul import load_soul, DEFAULT_SOUL
+        if not project_id:
+            return DEFAULT_SOUL
+        path_file = os.path.join("architect_memory", project_id, "project_path.txt")
+        try:
+            with open(path_file) as f:
+                project_path = f.read().strip()
+            return load_soul(project_path)
+        except OSError:
+            return DEFAULT_SOUL
+
     def _build_system_prompt(
         self,
         project_id: Optional[str],
@@ -201,10 +227,15 @@ class ChatEngine:
     ) -> str:
         """Build system prompt with retrieved code context."""
 
+        soul = self._load_soul(project_id)
+
         lines = [
             "You are Code Architect Agent — an expert in software architecture, design patterns, and code analysis.",
             "You answer questions about codebases that have been analyzed and stored in your memory system.",
             "Be precise, cite specific files/patterns when available, and acknowledge uncertainty.",
+            "",
+            "## Agent Soul & Personality",
+            soul,
             "",
         ]
 
@@ -236,7 +267,21 @@ class ChatEngine:
             hit_types = list({h["type"] for h in kw_hits})
             lines.append(f"## Memory Artifacts Referenced\nTypes found: {', '.join(hit_types)}\n")
 
-        if not semantic and not patterns and not kw_hits:
+        # Inject per-file module summaries from LLM analysis
+        modules = context.get("modules", [])
+        if modules:
+            lines.append("## Analyzed Files (from last analysis run)")
+            for mod in modules[:30]:  # cap to avoid token overflow
+                name = mod.get("name") or mod.get("file", "unknown")
+                purpose = mod.get("purpose") or mod.get("summary", "")
+                patterns_in = mod.get("patterns", [])
+                line = f"- **{name}**: {purpose}"
+                if patterns_in:
+                    line += f" [patterns: {', '.join(patterns_in[:3])}]"
+                lines.append(line)
+            lines.append("")
+
+        if not semantic and not patterns and not kw_hits and not modules:
             lines.append(
                 "Note: No project has been analyzed yet. "
                 "Ask the user to run an analysis first, or answer from general knowledge."

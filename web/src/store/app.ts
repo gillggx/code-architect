@@ -13,6 +13,13 @@ import { create } from 'zustand';
 // Domain types
 // ---------------------------------------------------------------------------
 
+export interface PendingApproval {
+  sessionId: string;
+  tool: string;
+  args: Record<string, unknown>;
+  diff?: string;
+}
+
 export interface AgentEvent {
   id: string;
   type:
@@ -24,12 +31,64 @@ export interface AgentEvent {
     | 'pattern'
     | 'skip'
     | 'done'
-    | 'error';
+    | 'error'
+    | 'tool_call'
+    | 'tool_output'
+    | 'approval_required'
+    | 'message'
+    | 'plan'
+    | 'escalation'
+    | 'session';
   message: string;
   file?: string;
   summary?: string;
   data?: Record<string, unknown>;
   timestamp: Date;
+  // Edit agent fields
+  tool?: string;
+  args?: Record<string, unknown>;
+  result?: string;
+  diff?: string;
+  content?: string;
+  approval_required?: boolean;
+  changes?: Array<{
+    file: string;
+    action: string;
+    content?: string;
+    diff?: string;
+    applied: boolean;
+  }>;
+}
+
+export interface PlanStep {
+  index: number;
+  description: string;
+  files_affected: string[];
+}
+
+export interface ExecutionPlan {
+  variant: string;
+  steps: PlanStep[];
+  confidence: number;
+  rationale: string;
+  risk_level: 'low' | 'medium' | 'high';
+}
+
+export interface PlanInfo {
+  planA: ExecutionPlan;
+  planB?: ExecutionPlan;
+  needsConfirmation: boolean;
+  confidenceGap: number;
+  sessionId: string;
+}
+
+export interface EscalationInfo {
+  sessionId: string;
+  failedTool: string;
+  errorMessage: string;
+  planBAttempted: boolean;
+  suggestedOptions: string[];
+  iteration: number;
 }
 
 export interface FileNode {
@@ -124,6 +183,23 @@ interface AppStore {
   // Center panel tab
   centerTab: 'activity' | 'chat';
   setCenterTab: (tab: 'activity' | 'chat') => void;
+
+  // Edit agent state
+  editMode: boolean;
+  setEditMode: (v: boolean) => void;
+  agentSession: string | null;
+  setAgentSession: (id: string | null) => void;
+  pendingApproval: PendingApproval | null;
+  setPendingApproval: (a: PendingApproval | null) => void;
+  modifiedFiles: Set<string>;
+  addModifiedFile: (f: string) => void;
+  clearModifiedFiles: () => void;
+
+  // Plan / escalation state
+  currentPlan: PlanInfo | null;
+  setCurrentPlan: (plan: PlanInfo | null) => void;
+  escalation: EscalationInfo | null;
+  setEscalation: (e: EscalationInfo | null) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +285,24 @@ export const useAppStore = create<AppStore>((set) => ({
   // Center panel tab
   centerTab: 'activity',
   setCenterTab: (tab) => set({ centerTab: tab }),
+
+  // Edit agent state
+  editMode: false,
+  setEditMode: (v) => set({ editMode: v }),
+  agentSession: null,
+  setAgentSession: (id) => set({ agentSession: id }),
+  pendingApproval: null,
+  setPendingApproval: (a) => set({ pendingApproval: a }),
+  modifiedFiles: new Set<string>(),
+  addModifiedFile: (f) =>
+    set((s) => ({ modifiedFiles: new Set([...s.modifiedFiles, f]) })),
+  clearModifiedFiles: () => set({ modifiedFiles: new Set<string>() }),
+
+  // Plan / escalation state
+  currentPlan: null,
+  setCurrentPlan: (plan) => set({ currentPlan: plan }),
+  escalation: null,
+  setEscalation: (e) => set({ escalation: e }),
 }));
 
 // ---------------------------------------------------------------------------

@@ -40,6 +40,12 @@ from .schemas import (
     ValidationRequest, ValidationResponse, ValidationIssue,
     SuggestionRequest, SuggestionResponse, PatternSuggestion,
     ChatRequest, A2AQueryRequest, A2AQueryResponse,
+    GenerateRequest, GenerateResponse, FileChangeSchema,
+    ValidateRequest, ValidateResponse,
+    ImpactRequest, ImpactResponse,
+    ApproveRequest,
+    ApprovePlanRequest,
+    EscalationRequest,
 )
 from ..llm import create_chat_engine, get_or_create_session
 from .websocket import (
@@ -285,6 +291,20 @@ def create_app(debug: bool = False) -> FastAPI:
                 async with _app_state._lock:
                     _app_state.active_jobs[job_id]["status"] = "complete"
                     _app_state.active_jobs[job_id]["summary"] = summary
+
+                # Persist project path for later use by edit agent
+                os.makedirs(memory_dir, exist_ok=True)
+                with open(os.path.join(memory_dir, "project_path.txt"), "w") as _pf:
+                    _pf.write(os.path.abspath(request.project_path))
+
+                # Persist modules to disk + inject into chat engine
+                if summary.modules:
+                    import json as _json
+                    modules_path = os.path.join(memory_dir, "modules.json")
+                    os.makedirs(memory_dir, exist_ok=True)
+                    with open(modules_path, "w") as _f:
+                        _json.dump(summary.modules, _f, ensure_ascii=False, indent=2)
+                    _app_state.chat_engine.update_project_context(project_id, summary.modules)
 
                 await manager.broadcast_to_job(job_id, WebSocketMessage(
                     type="agent_event",
@@ -558,6 +578,18 @@ def create_app(debug: bool = False) -> FastAPI:
         """
         import json
 
+        # Auto-load persisted modules from disk if not already in memory
+        if request.project_id and request.project_id not in _app_state.chat_engine._project_modules:
+            modules_path = os.path.join("architect_memory", request.project_id, "modules.json")
+            if os.path.exists(modules_path):
+                try:
+                    with open(modules_path) as _f:
+                        stored = json.load(_f)
+                    _app_state.chat_engine.update_project_context(request.project_id, stored)
+                    logger.info("Chat: loaded %d modules from disk for %s", len(stored), request.project_id)
+                except Exception as _e:
+                    logger.warning("Chat: failed to load modules.json: %s", _e)
+
         session = get_or_create_session(request.session_id, request.project_id)
 
         async def event_stream():
@@ -647,6 +679,313 @@ def create_app(debug: bool = False) -> FastAPI:
         from ..mcp import MCPServer
         server = MCPServer()
         return server.get_schema()
+
+    # ========================================================================
+    # Code Edit Agent Endpoints
+    # ========================================================================
+
+    def _load_project_modules(project_id: str) -> list:
+        """Load project modules from disk or in-memory cache."""
+        import json as _json
+        if project_id in _app_state.chat_engine._project_modules:
+            return _app_state.chat_engine._project_modules[project_id]
+        modules_path = os.path.join("architect_memory", project_id, "modules.json")
+        if os.path.exists(modules_path):
+            try:
+                with open(modules_path) as _f:
+                    mods = _json.load(_f)
+                _app_state.chat_engine.update_project_context(project_id, mods)
+                return mods
+            except Exception as _e:
+                logger.warning("Could not load modules.json for %s: %s", project_id, _e)
+        return []
+
+    def _resolve_project_path(project_id: str) -> str:
+        """Resolve absolute project path from job registry or modules.json."""
+        # Check active_jobs first
+        for job in _app_state.active_jobs.values():
+            if job.get("project_id") == project_id:
+                return job.get("project_path", "")
+        # Fall back to a directory named after project_id under cwd
+        candidate = os.path.join("architect_memory", project_id, "project_path.txt")
+        if os.path.exists(candidate):
+            with open(candidate) as _f:
+                return _f.read().strip()
+        return ""
+
+    @app.post(
+        "/api/a2a/generate",
+        tags=["a2a"],
+        summary="Generate / apply code changes via the edit agent",
+    )
+    async def generate_code(request: GenerateRequest):
+        """
+        Run the Code Edit Agent for a given task.
+
+        - dry_run: returns proposed changes without writing to disk.
+        - apply: writes changes immediately and returns results.
+        - interactive: returns SSE stream with approval events.
+        """
+        import json as _json
+        from .agent_runner import AgentRunner, AGENT_MODEL
+
+        project_modules = _load_project_modules(request.project_id)
+        project_path = _resolve_project_path(request.project_id)
+
+        if not project_path:
+            raise ValidationError(
+                f"Project path not found for project_id '{request.project_id}'. "
+                "Run an analysis first.",
+                field="project_id",
+            )
+
+        if request.mode == "interactive":
+            session_id = str(uuid4())
+            runner = AgentRunner(
+                task=request.task,
+                project_path=project_path,
+                project_modules=project_modules,
+                mode="interactive",
+                context=request.context,
+                session_id=session_id,
+            )
+
+            async def sse_stream():
+                # Send session_id first so the client can use /api/agent/approve
+                yield f"data: {_json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
+                async for event in runner.run():
+                    yield f"data: {_json.dumps(event.to_dict())}\n\n"
+
+            return StreamingResponse(
+                sse_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        # dry_run or apply — collect all events and return JSON
+        runner = AgentRunner(
+            task=request.task,
+            project_path=project_path,
+            project_modules=project_modules,
+            mode=request.mode,
+            context=request.context,
+        )
+
+        explanation = ""
+        async for event in runner.run():
+            if event.type in ("message", "done") and event.content:
+                explanation = event.content
+
+        changes = [
+            FileChangeSchema(
+                file=c.file,
+                action=c.action,
+                content=c.content,
+                diff=c.diff,
+                applied=c.applied,
+            )
+            for c in runner.changes
+        ]
+
+        return GenerateResponse(
+            changes=changes,
+            plan=[],
+            explanation=explanation,
+            patterns_used=[],
+            tests_suggested=[],
+            applied=(request.mode == "apply"),
+            model_used=AGENT_MODEL,
+            session_id=None,
+        )
+
+    @app.post(
+        "/api/a2a/validate",
+        response_model=ValidateResponse,
+        tags=["a2a"],
+        summary="Validate proposed code changes against project patterns",
+    )
+    async def validate_changes(request: ValidateRequest) -> ValidateResponse:
+        """
+        Use the LLM to check whether proposed changes match project patterns
+        and conventions.
+        """
+        from ..llm.model_router import create_model_router
+
+        project_modules = _load_project_modules(request.project_id)
+        session_id = f"validate-{request.project_id}-{uuid4()}"
+        session = get_or_create_session(session_id, request.project_id)
+
+        changes_summary = "\n".join(
+            f"- {c.action} {c.file}" for c in request.changes
+        )
+        prompt = (
+            "Review these proposed code changes and assess if they are consistent "
+            "with the project's architecture and patterns.\n\n"
+            f"Changes:\n{changes_summary}\n\n"
+            "Respond in JSON with keys: valid (bool), confidence (0-1), "
+            "issues (list[str]), warnings (list[str]), "
+            "patterns_matched (list[str]), patterns_missing (list[str])."
+        )
+
+        answer = await _app_state.chat_engine.complete_chat(session, prompt)
+
+        # Try to parse JSON from the answer
+        import re as _re
+        try:
+            m = _re.search(r"\{.*\}", answer, _re.DOTALL)
+            if m:
+                data = _json_loads_safe(m.group(0))
+                return ValidateResponse(**data)
+        except Exception:
+            pass
+
+        # Fallback: optimistic response
+        return ValidateResponse(
+            valid=True,
+            confidence=0.7,
+            issues=[],
+            warnings=["Could not parse LLM validation response"],
+            patterns_matched=[],
+            patterns_missing=[],
+        )
+
+    @app.post(
+        "/api/a2a/impact",
+        response_model=ImpactResponse,
+        tags=["a2a"],
+        summary="Analyse the impact of changing a set of files",
+    )
+    async def impact_analysis(request: ImpactRequest) -> ImpactResponse:
+        """
+        Use the LLM and project modules to estimate which files will be
+        affected by the proposed change.
+        """
+        project_modules = _load_project_modules(request.project_id)
+        session_id = f"impact-{request.project_id}-{uuid4()}"
+        session = get_or_create_session(session_id, request.project_id)
+
+        files_str = ", ".join(request.files)
+        prompt = (
+            f"Analyse the impact of the following change on the project:\n\n"
+            f"Change: {request.change_description}\n"
+            f"Files being modified: {files_str}\n\n"
+            "List other files likely to be affected, explain the risk (low/medium/high), "
+            "and give a recommendation.\n\n"
+            "Respond in JSON: {affected_files: [{file, reason, risk}], "
+            "risk: 'low'|'medium'|'high', confidence: 0-1, recommendation: str}"
+        )
+
+        answer = await _app_state.chat_engine.complete_chat(session, prompt)
+
+        import re as _re
+        try:
+            m = _re.search(r"\{.*\}", answer, _re.DOTALL)
+            if m:
+                data = _json_loads_safe(m.group(0))
+                return ImpactResponse(**data)
+        except Exception:
+            pass
+
+        return ImpactResponse(
+            affected_files=[],
+            risk="low",
+            confidence=0.5,
+            recommendation=answer[:500] if answer else "No recommendation available.",
+        )
+
+    @app.post(
+        "/api/agent/approve",
+        tags=["agent"],
+        summary="Approve or reject a pending agent action",
+    )
+    async def approve_action(request: ApproveRequest) -> dict:
+        """
+        Signal the waiting AgentRunner to continue (apply/skip/stop/edit).
+        Must be called while the SSE stream for the session is still open.
+        """
+        from .agent_runner import get_session as _get_session
+
+        sess = _get_session(request.session_id)
+        if sess is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session '{request.session_id}' not found or already complete.",
+            )
+        if request.action not in ("apply", "skip", "stop", "edit"):
+            raise HTTPException(
+                status_code=422,
+                detail="action must be one of: apply, skip, stop, edit",
+            )
+
+        sess.approved_action = request.action
+        sess.edited_content = request.edited_content
+        sess.approval_event.set()
+
+        return {"ok": True, "session_id": request.session_id, "action": request.action}
+
+    @app.post(
+        "/api/agent/approve-plan",
+        tags=["agent"],
+        summary="Approve or reject the execution plan",
+    )
+    async def approve_plan(request: ApprovePlanRequest) -> dict:
+        from .agent_runner import get_session as _get_session
+        sess = _get_session(request.session_id)
+        if sess is None:
+            raise HTTPException(status_code=404, detail=f"Session '{request.session_id}' not found.")
+        sess.plan_approved_action = request.action
+        sess.plan_approval_event.set()
+        return {"ok": True, "session_id": request.session_id, "action": request.action}
+
+    @app.post(
+        "/api/agent/escalate",
+        tags=["agent"],
+        summary="Respond to an escalation event",
+    )
+    async def handle_escalation(request: EscalationRequest) -> dict:
+        from .agent_runner import get_session as _get_session
+        sess = _get_session(request.session_id)
+        if sess is None:
+            raise HTTPException(status_code=404, detail=f"Session '{request.session_id}' not found.")
+        sess.escalation_action = request.action
+        sess.escalation_instruction = request.instruction
+        sess.escalation_event.set()
+        return {"ok": True, "session_id": request.session_id, "action": request.action}
+
+    @app.get(
+        "/api/agent/sessions/{session_id}",
+        tags=["agent"],
+        summary="Get agent session status",
+    )
+    async def get_agent_session(session_id: str) -> dict:
+        """Return current status of an agent session."""
+        from .agent_runner import get_session as _get_session
+
+        sess = _get_session(session_id)
+        if sess is None:
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+        return {
+            "session_id": sess.session_id,
+            "status": sess.status,
+            "pending_approval": sess.approval_event.is_set() is False and sess.status == "running",
+        }
+
+    @app.post(
+        "/api/agent/sessions/{session_id}/stop",
+        tags=["agent"],
+        summary="Stop a running agent session",
+    )
+    async def stop_agent_session(session_id: str) -> dict:
+        """Immediately stop a running agent session."""
+        from .agent_runner import get_session as _get_session
+
+        sess = _get_session(session_id)
+        if sess is None:
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+        sess.status = "stopped"
+        sess.approved_action = "stop"
+        sess.approval_event.set()  # unblock any waiting approval
+        return {"ok": True, "session_id": session_id}
 
     # ========================================================================
     # File System Helpers (for GUI folder browser + pre-scan)
@@ -807,6 +1146,20 @@ def create_app(debug: bool = False) -> FastAPI:
         )
     
     return app
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _json_loads_safe(s: str) -> dict:
+    """Load JSON, converting Python-style booleans / None if needed."""
+    import json as _json
+    try:
+        return _json.loads(s)
+    except Exception:
+        fixed = s.replace("True", "true").replace("False", "false").replace("None", "null")
+        return _json.loads(fixed)
 
 
 # Create default application instance

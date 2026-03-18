@@ -249,28 +249,47 @@ class LLMAnalyzer:
         ))
 
         # --- 1b. Incremental: load old snapshot, detect changes ---
+        # Snapshot only records ANALYZED files (not entire project), so we can
+        # safely save it after each file without incorrectly marking unanalyzed
+        # files as done.
         detector = ChangeDetector()
         old_snapshot: Optional[ProjectSnapshot] = None
         if memory_dir:
             old_snapshot = await detector.load_snapshot(memory_dir)
             if old_snapshot:
-                new_snapshot = await detector.snapshot_project(project_path)
-                changed, added, deleted = detector.diff_snapshots(old_snapshot, new_snapshot)
-                change_desc = detector.describe_changes(changed, added, deleted)
-                await self._emit(AgentEvent(
-                    type="scan",
-                    message=f"Incremental mode: {change_desc} since last analysis.",
-                    data={"changed": len(changed), "added": len(added), "deleted": len(deleted)},
-                ))
-                # Emit skip events for unchanged files (carry over previous summaries)
-                unchanged = set(old_snapshot.file_snapshots.keys()) - set(changed) - set(deleted)
-                for fp in sorted(unchanged):
-                    rel = os.path.relpath(fp, project_path)
-                    await self._emit(AgentEvent(type="skip", message=f"Unchanged: {rel}", file=rel))
-                # Only analyse changed + new files
-                files_to_analyze = set(changed + added)
-                all_files = [f for f in all_files if f in files_to_analyze]
-                files_scanned = len(all_files)  # update count for progress
+                # Build current snapshot only for files in priority list
+                import time as _time
+                current_file_snaps = {}
+                for fp in all_files:
+                    try:
+                        stat = os.stat(fp)
+                        current_file_snaps[fp] = {
+                            "mtime": stat.st_mtime,
+                            "size": stat.st_size,
+                        }
+                    except OSError:
+                        pass
+
+                # A file needs analysis if: not in snapshot, or mtime/size changed
+                already_done = set()
+                for fp, snap in old_snapshot.file_snapshots.items():
+                    cur = current_file_snaps.get(fp)
+                    if cur and cur["mtime"] == snap.mtime and cur["size"] == snap.size:
+                        already_done.add(fp)
+
+                skipped_count = len(already_done)
+                if skipped_count > 0:
+                    await self._emit(AgentEvent(
+                        type="scan",
+                        message=f"Incremental mode: skipping {skipped_count} already-analyzed files.",
+                        data={"skipped_analyzed": skipped_count},
+                    ))
+                    for fp in sorted(already_done):
+                        rel = os.path.relpath(fp, project_path)
+                        await self._emit(AgentEvent(type="skip", message=f"Already analyzed: {rel}", file=rel))
+
+                all_files = [f for f in all_files if f not in already_done]
+                files_scanned = len(all_files)
 
         # --- 2. Prioritise ---
         priority_files = self._prioritize_files(all_files)
@@ -290,11 +309,35 @@ class LLMAnalyzer:
         modules: List[dict] = []
         all_patterns_seen: List[str] = []
 
-        for file_path in priority_files:
+        for idx, file_path in enumerate(priority_files, 1):
+            logger.info("Analyzing file %d/%d: %s", idx, len(priority_files), file_path)
             result = await self._analyze_file(file_path, project_path)
             if result is not None:
                 modules.append(result)
                 all_patterns_seen.extend(result.get("patterns", []))
+                # Save incremental snapshot after each file so progress survives interruptions.
+                # We only record files we've ACTUALLY analyzed, not the whole project.
+                if memory_dir:
+                    try:
+                        existing = await detector.load_snapshot(memory_dir)
+                        snaps = dict(existing.file_snapshots) if existing else {}
+                        stat = os.stat(file_path)
+                        from ..memory.incremental_analysis import FileSnapshot as _FileSnapshot
+                        import time as _time
+                        snaps[file_path] = _FileSnapshot(
+                            path=file_path,
+                            mtime=stat.st_mtime,
+                            size=stat.st_size,
+                        )
+                        from ..memory.incremental_analysis import ProjectSnapshot as _ProjectSnapshot
+                        partial_snap = _ProjectSnapshot(
+                            project_path=project_path,
+                            analyzed_at=_time.time(),
+                            file_snapshots=snaps,
+                        )
+                        await detector.save_snapshot(partial_snap, memory_dir)
+                    except Exception as _exc:
+                        logger.warning("Failed to save incremental snapshot: %s", _exc)
 
         # Deduplicate patterns while preserving order
         seen: set[str] = set()
@@ -311,13 +354,7 @@ class LLMAnalyzer:
             data={"files_stored": len(self._memory)},
         ))
 
-        # --- 4b. Save snapshot for incremental analysis next time ---
-        if memory_dir:
-            try:
-                new_snap = await detector.snapshot_project(project_path)
-                await detector.save_snapshot(new_snap, memory_dir)
-            except Exception as exc:
-                logger.warning("Failed to save snapshot: %s", exc)
+        # --- 4b. Final snapshot already saved per-file above; nothing to do here ---
 
         duration = time.monotonic() - start_time
 
@@ -480,7 +517,18 @@ class LLMAnalyzer:
         messages = [{"role": "user", "content": prompt}]
 
         try:
-            raw_response = await self._llm.complete(messages)
+            raw_response = await asyncio.wait_for(
+                self._llm.complete(messages),
+                timeout=90.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("LLM call timed out for %s (90s), skipping", file_path)
+            await self._emit(AgentEvent(
+                type="error",
+                message=f"Timeout (90s) reading {filename}, skipping.",
+                file=file_path,
+            ))
+            return None
         except Exception as exc:
             logger.error("LLM call failed for %s: %s", file_path, exc)
             await self._emit(AgentEvent(
