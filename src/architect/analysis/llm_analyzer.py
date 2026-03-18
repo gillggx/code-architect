@@ -233,12 +233,14 @@ class LLMAnalyzer:
         """
         start_time = time.monotonic()
         project_path = str(Path(project_path).resolve())
+        logger.info("=== analyze_project START: %s ===", project_path)
 
         # --- 1. Scan ---
         await self._emit(AgentEvent(
             type="scan",
             message=f"Scanning {project_path}...",
         ))
+        logger.info("Scan started")
         all_files = self._scan_directory(project_path)
         files_scanned = len(all_files)
 

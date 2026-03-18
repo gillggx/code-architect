@@ -106,6 +106,27 @@ body {
   background: #e8f4fd;
 }
 
+.topbar-analyzing {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: rgba(255,255,255,0.9);
+  font-size: 0.82rem;
+}
+
+.topbar-cancel-btn {
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.6);
+  cursor: pointer;
+  font-size: 0.75rem;
+  padding: 0 2px;
+  line-height: 1;
+}
+.topbar-cancel-btn:hover {
+  color: #fff;
+}
+
 /* ── Body — 3 panels ─────────────────────────────────── */
 .app-body {
   display: flex;

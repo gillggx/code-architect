@@ -80,15 +80,17 @@ class WebSocketMessage:
 
 class WebSocketConnectionManager:
     """Manages WebSocket connections and broadcasting
-    
+
     Handles multiple client connections and allows broadcasting
     messages to all connected clients or specific jobs.
+    Buffers events per job so late-connecting clients get a full replay.
     """
-    
+
     def __init__(self):
         """Initialize connection manager"""
         self.active_connections: Dict[str, Set[WebSocket]] = {}
         self.job_connections: Dict[str, Set[str]] = {}  # job_id -> client_ids
+        self.job_event_buffer: Dict[str, list] = {}     # job_id -> [msg_json, ...]
         self._lock = asyncio.Lock()
     
     async def connect(self, websocket: WebSocket, client_id: str) -> None:
@@ -122,13 +124,19 @@ class WebSocketConnectionManager:
         
         logger.info(f"Client {client_id} disconnected")
     
+    async def init_job_buffer(self, job_id: str) -> None:
+        """Create event buffer for a new job (call when job is created)."""
+        async with self._lock:
+            if job_id not in self.job_event_buffer:
+                self.job_event_buffer[job_id] = []
+
     async def register_job(
         self,
         job_id: str,
         client_id: str,
     ) -> None:
-        """Register client for job updates
-        
+        """Register client for job updates and replay buffered events.
+
         Args:
             job_id: Job identifier
             client_id: Client identifier
@@ -137,8 +145,20 @@ class WebSocketConnectionManager:
             if job_id not in self.job_connections:
                 self.job_connections[job_id] = set()
             self.job_connections[job_id].add(client_id)
-        
-        logger.info(f"Registered {client_id} for job {job_id}")
+            buffered = list(self.job_event_buffer.get(job_id, []))
+
+        logger.info(f"Registered {client_id} for job {job_id} ({len(buffered)} buffered events to replay)")
+
+        # Replay missed events immediately
+        if buffered:
+            async with self._lock:
+                connections = self.active_connections.get(client_id, set()).copy()
+            for ws in connections:
+                for msg_json in buffered:
+                    try:
+                        await ws.send_text(msg_json)
+                    except Exception as e:
+                        logger.error(f"Error replaying event to {client_id}: {e}")
     
     async def unregister_job(
         self,
@@ -180,15 +200,22 @@ class WebSocketConnectionManager:
         job_id: str,
         message: WebSocketMessage,
     ) -> None:
-        """Broadcast message to clients watching specific job
-        
+        """Broadcast message to clients watching specific job.
+        Always buffers the event so late-connecting clients get a replay.
+
         Args:
             job_id: Job identifier
             message: Message to send
         """
+        msg_json = message.to_json()
+
         async with self._lock:
+            # Buffer every event for this job
+            if job_id not in self.job_event_buffer:
+                self.job_event_buffer[job_id] = []
+            self.job_event_buffer[job_id].append(msg_json)
             client_ids = self.job_connections.get(job_id, set()).copy()
-        
+
         for client_id in client_ids:
             await self.send_to_client(client_id, message)
     

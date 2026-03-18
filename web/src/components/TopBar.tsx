@@ -347,7 +347,19 @@ const TopBar: React.FC = () => {
           </span>
         )}
         <div className="topbar-actions">
-          {isRunning && <span className="topbar-analyzing"><span className="spinner" /> Analyzing…</span>}
+          {isRunning && (
+            <span className="topbar-analyzing">
+              <span className="spinner" /> Analyzing…
+              <button
+                className="topbar-cancel-btn"
+                title="Cancel / clear stuck state"
+                onClick={() => {
+                  currentJob?.ws?.close();
+                  setCurrentJob(null);
+                }}
+              >✕</button>
+            </span>
+          )}
           <button className="topbar-btn analyze" onClick={() => { setModalError(''); setShowModal(true); }} disabled={isRunning}>
             Analyze
           </button>

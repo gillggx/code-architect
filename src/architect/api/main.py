@@ -256,6 +256,10 @@ def create_app(debug: bool = False) -> FastAPI:
                 "summary": None,
             }
 
+        # Init event buffer BEFORE task starts so no events are missed
+        manager = get_connection_manager()
+        await manager.init_job_buffer(job_id)
+
         async def run_analysis():
             manager = get_connection_manager()
 
