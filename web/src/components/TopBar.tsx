@@ -317,6 +317,15 @@ const TopBar: React.FC = () => {
         addEvent({ id: crypto.randomUUID(), type: 'error', message: 'WebSocket connection error', timestamp: new Date() });
         setCurrentJob({ ...job, status: 'error' });
       };
+
+      ws.onclose = (ev) => {
+        // If job never reached 'complete', mark as error so UI unblocks
+        const latestJob = useAppStore.getState().currentJob;
+        if (latestJob?.status === 'running') {
+          addEvent({ id: crypto.randomUUID(), type: 'error', message: `Connection closed${ev.reason ? ': ' + ev.reason : ''}`, timestamp: new Date() });
+          setCurrentJob({ ...job, status: 'error' });
+        }
+      };
     } catch (err) {
       setModalError((err as Error).message || 'Failed to start analysis');
     } finally {
