@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 AGENT_MODEL = os.getenv("DEFAULT_LLM_MODEL", "anthropic/claude-sonnet-4-5")
-MAX_ITERATIONS = 20
+MAX_ITERATIONS = 40
 APPROVAL_TIMEOUT = 300  # 5 minutes
 
 
@@ -357,6 +357,7 @@ class AgentRunner:
         mode: str = "dry_run",
         context: Optional[str] = None,
         session_id: Optional[str] = None,
+        chat_history: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         self.task = task
         self.project_path = project_path
@@ -364,6 +365,7 @@ class AgentRunner:
         self.mode = mode  # "dry_run" | "apply" | "interactive"
         self.context = context
         self.session_id = session_id or str(uuid4())
+        self.chat_history: List[Dict[str, str]] = chat_history or []
 
         self._changes: List[FileChange] = []
         self._plan: List[str] = []
@@ -484,34 +486,53 @@ class AgentRunner:
         # Truncate task to avoid token overflow in planning call
         task_summary = self.task[:800] if len(self.task) > 800 else self.task
 
-        system_msg = "You are a software engineering planner. You output ONLY valid JSON, no explanation, no markdown fences."
-        user_msg = f"""Generate an execution plan for this task.
+        system_msg = (
+            "You are a software engineering planner. "
+            "You always respond with valid JSON only. No markdown, no explanation."
+        )
+        user_msg = f"""Task: {task_summary}
 
-Project modules:
-{module_summary}
+Relevant modules: {module_summary[:400] if module_summary else "unknown"}
 
-Task:
-{task_summary}
+Respond with JSON exactly like this example:
+{{
+  "plan_a": {{
+    "steps": [
+      {{"index": 1, "description": "Read the target file to understand current structure", "files_affected": ["src/foo.ts"]}},
+      {{"index": 2, "description": "Edit the function to add the new behaviour", "files_affected": ["src/foo.ts"]}},
+      {{"index": 3, "description": "Run tests to verify", "files_affected": []}}
+    ],
+    "confidence": 0.85,
+    "rationale": "Direct approach with minimal risk",
+    "risk_level": "low"
+  }}
+}}
 
-Output ONLY this JSON structure (no other text):
-{{"plan_a":{{"steps":[{{"index":1,"description":"...","files_affected":["file.py"]}}],"confidence":0.8,"rationale":"...","risk_level":"low"}},"plan_b":{{"steps":[{{"index":1,"description":"...","files_affected":[]}}],"confidence":0.5,"rationale":"...","risk_level":"medium"}}}}
-
-Rules:
-- confidence: 0.0-1.0 float
-- risk_level: "low" | "medium" | "high"
-- plan_b key may be omitted if only one approach exists
-- steps must be concrete and actionable"""
+Now generate the real plan for the task above. You may include plan_b if there is a meaningfully different alternative approach. Keep steps concrete."""
 
         try:
-            response = await client.chat.completions.create(
-                model=AGENT_MODEL,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                max_tokens=1024,
-                temperature=0.2,
-            )
+            try:
+                response = await client.chat.completions.create(
+                    model=AGENT_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    max_tokens=1024,
+                    temperature=0.2,
+                    response_format={"type": "json_object"},
+                )
+            except Exception:
+                # Model doesn't support response_format — retry without it
+                response = await client.chat.completions.create(
+                    model=AGENT_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    max_tokens=1024,
+                    temperature=0.2,
+                )
             raw = response.choices[0].message.content or ""
             logger.debug("Plan LLM raw response: %s", raw[:500])
             # Extract JSON — find the outermost { } block robustly
@@ -706,185 +727,238 @@ Rules:
             if self._session and self._session.status in ("stopped", "error"):
                 return
 
-        messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": self.task},
-        ]
+        # Split plan into chunks so large tasks don't hit MAX_ITERATIONS
+        plan_a = self._session.plan_a if self._session else None
+        all_steps = plan_a.steps if plan_a else []
+        chunks: List[List[Any]] = (
+            [all_steps[i:i + CHUNK_SIZE] for i in range(0, len(all_steps), CHUNK_SIZE)]
+            if all_steps else [[]]
+        )
+        total_chunks = len(chunks)
 
-        for iteration in range(MAX_ITERATIONS):
-            logger.info("Agent iteration %d/%d", iteration + 1, MAX_ITERATIONS)
+        if total_chunks > 1:
+            yield ToolCallEvent(
+                type="message",
+                content=f"Large task ({len(all_steps)} steps) — splitting into {total_chunks} phases.",
+            )
 
-            # Check if session was stopped
-            if self._session and self._session.status == "stopped":
-                yield ToolCallEvent(type="done", content="Stopped by user.", changes=self._changes)
+        prev_summary = ""
+
+        for chunk_idx, chunk_steps in enumerate(chunks):
+            if self._session and self._session.status in ("stopped", "error"):
                 return
 
-            try:
-                response = await client.chat.completions.create(
-                    model=AGENT_MODEL,
-                    messages=messages,
-                    tools=TOOL_DEFINITIONS,
-                    tool_choice="auto",
-                    max_tokens=4096,
-                )
-            except Exception as exc:
-                logger.error("LLM call failed: %s", exc)
-                yield ToolCallEvent(type="error", error=f"LLM error: {exc}")
-                return
-
-            msg = response.choices[0].message
-            tool_calls = msg.tool_calls or []
-
-            if not tool_calls:
-                # Final message — agent is done
-                final_content = msg.content or ""
+            if total_chunks > 1:
+                step_range = f"{chunk_steps[0].index}–{chunk_steps[-1].index}" if chunk_steps else "?"
                 yield ToolCallEvent(
                     type="message",
-                    content=final_content,
+                    content=f"Phase {chunk_idx + 1}/{total_chunks} — steps {step_range}",
                 )
-                yield ToolCallEvent(
-                    type="done",
-                    content=final_content,
-                    changes=self._changes,
-                    summary=final_content,
-                )
-                if self._session:
-                    self._session.status = "complete"
-                return
 
-            # Append assistant message with tool_calls
-            messages.append({"role": "assistant", "content": msg.content, "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                }
-                for tc in tool_calls
-            ]})
+            # Build task message for this chunk
+            if chunk_steps:
+                step_list = "\n".join(f"{s.index}. {s.description}" for s in chunk_steps)
+                if total_chunks > 1:
+                    prefix = f"Previous phase summary:\n{prev_summary}\n\n" if prev_summary else ""
+                    task_with_plan = (
+                        f"{prefix}Task: {self.task}\n\n"
+                        f"Execute ONLY these steps (phase {chunk_idx + 1}/{total_chunks}):\n{step_list}"
+                    )
+                else:
+                    task_with_plan = f"{self.task}\n\nExecute this approved plan step by step:\n{step_list}"
+            else:
+                task_with_plan = self.task
 
-            # Execute each tool call
-            for tc in tool_calls:
-                fn_name = tc.function.name
+            messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+
+            # Inject chat history only on first chunk
+            if chunk_idx == 0:
+                for hist_msg in self.chat_history:
+                    if hist_msg.get("role") in ("user", "assistant") and hist_msg.get("content"):
+                        messages.append({"role": hist_msg["role"], "content": hist_msg["content"]})
+
+            messages.append({"role": "user", "content": task_with_plan})
+
+            chunk_completed = False
+
+            for iteration in range(MAX_ITERATIONS):
+                logger.info("Phase %d/%d iteration %d/%d", chunk_idx + 1, total_chunks, iteration + 1, MAX_ITERATIONS)
+
+                # Check if session was stopped
+                if self._session and self._session.status == "stopped":
+                    yield ToolCallEvent(type="done", content="Stopped by user.", changes=self._changes)
+                    return
+
+                # Force tool use on first iteration so agent doesn't just output analysis text
+                tc_mode = "required" if iteration == 0 else "auto"
+
                 try:
-                    fn_args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    fn_args = {}
+                    response = await client.chat.completions.create(
+                        model=AGENT_MODEL,
+                        messages=messages,
+                        tools=TOOL_DEFINITIONS,
+                        tool_choice=tc_mode,
+                        max_tokens=4096,
+                    )
+                except Exception as exc:
+                    logger.error("LLM call failed: %s", exc)
+                    yield ToolCallEvent(type="error", error=f"LLM error: {exc}")
+                    return
 
-                yield ToolCallEvent(type="tool_call", tool=fn_name, args=fn_args)
+                msg = response.choices[0].message
+                tool_calls = msg.tool_calls or []
 
-                # For mutating tools in interactive mode: request approval
-                is_mutating = fn_name in ("write_file", "edit_file", "run_command")
-                if self.mode == "interactive" and is_mutating and self._session:
-                    # Compute preview diff for file operations
-                    preview_diff = ""
-                    if fn_name in ("write_file", "edit_file"):
-                        preview_diff = self._compute_preview_diff(fn_name, fn_args)
+                if not tool_calls:
+                    # Phase complete — collect summary for next chunk
+                    prev_summary = msg.content or ""
+                    yield ToolCallEvent(type="message", content=prev_summary)
+                    chunk_completed = True
+                    if chunk_idx == total_chunks - 1:
+                        # Last chunk — emit final done
+                        yield ToolCallEvent(
+                            type="done",
+                            content=prev_summary,
+                            changes=self._changes,
+                            summary=prev_summary,
+                        )
+                        if self._session:
+                            self._session.status = "complete"
+                        return
+                    break  # Move to next chunk
 
+                # Append assistant message with tool_calls
+                messages.append({"role": "assistant", "content": msg.content, "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in tool_calls
+                ]})
+
+                # Execute each tool call
+                for tc in tool_calls:
+                    fn_name = tc.function.name
+                    try:
+                        fn_args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        fn_args = {}
+
+                    yield ToolCallEvent(type="tool_call", tool=fn_name, args=fn_args)
+
+                    # For mutating tools in interactive mode: request approval
+                    is_mutating = fn_name in ("write_file", "edit_file", "run_command")
+                    if self.mode == "interactive" and is_mutating and self._session:
+                        # Compute preview diff for file operations
+                        preview_diff = ""
+                        if fn_name in ("write_file", "edit_file"):
+                            preview_diff = self._compute_preview_diff(fn_name, fn_args)
+
+                        yield ToolCallEvent(
+                            type="approval_required",
+                            tool=fn_name,
+                            args=fn_args,
+                            diff=preview_diff,
+                            approval_required=True,
+                        )
+
+                        # Reset event and wait
+                        self._session.approval_event.clear()
+                        try:
+                            await asyncio.wait_for(
+                                self._session.approval_event.wait(),
+                                timeout=APPROVAL_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            yield ToolCallEvent(type="error", error="Approval timeout — agent stopped.")
+                            self._session.status = "stopped"
+                            return
+
+                        action = self._session.approved_action
+                        if action == "stop":
+                            yield ToolCallEvent(type="done", content="Stopped by user.", changes=self._changes)
+                            self._session.status = "stopped"
+                            return
+                        if action == "skip":
+                            tool_result = "skipped by user"
+                            if fn_name in ("write_file", "edit_file"):
+                                pass
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": tool_result,
+                            })
+                            yield ToolCallEvent(type="tool_output", tool=fn_name, result=tool_result)
+                            continue
+                        if action == "edit" and self._session.edited_content is not None:
+                            if fn_name in ("write_file", "edit_file"):
+                                fn_args = dict(fn_args)
+                                fn_args["content"] = self._session.edited_content
+                                if fn_name == "edit_file":
+                                    fn_name = "write_file"
+
+                    # Execute tool (with escalation on failure for mutating tools)
+                    file_change = None
+                    try:
+                        tool_result, file_change = await self._execute_tool(fn_name, fn_args)
+                    except ToolExecutionError as tool_exc:
+                        plan_b_msg = ""
+                        if self._session and self._session.plan_b and not self._session.plan_b_exhausted:
+                            plan_b = self._session.plan_b
+                            plan_b_msg = f"\n\nPlan B is available. Switching approach: {plan_b.rationale}"
+
+                        async for evt in self._run_escalation(tool_exc, iteration):
+                            yield evt
+
+                        if self._session and self._session.status in ("stopped", "error"):
+                            return
+
+                        escalation_action = self._session.escalation_action if self._session else None
+                        if escalation_action == "stop":
+                            yield ToolCallEvent(type="done", content="Stopped after escalation.", changes=self._changes)
+                            if self._session:
+                                self._session.status = "stopped"
+                            return
+                        elif escalation_action == "manual_fix":
+                            tool_result = f"User applied manual fix for {tool_exc.fn_name}. Continuing."
+                        elif self._session and self._session.escalation_instruction:
+                            messages.append({
+                                "role": "user",
+                                "content": f"Previous attempt failed. User instruction: {self._session.escalation_instruction}{plan_b_msg}",
+                            })
+                            tool_result = f"Escalated — user provided alternative instruction."
+                            self._session.escalation_instruction = None
+                        else:
+                            tool_result = f"Tool failed (escalated): {tool_exc.error_message}.{plan_b_msg}"
+
+                    if file_change:
+                        self._changes.append(file_change)
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": tool_result,
+                    })
                     yield ToolCallEvent(
-                        type="approval_required",
+                        type="tool_output",
                         tool=fn_name,
-                        args=fn_args,
-                        diff=preview_diff,
-                        approval_required=True,
+                        result=tool_result,
+                        diff=file_change.diff if file_change else None,
                     )
 
-                    # Reset event and wait
-                    self._session.approval_event.clear()
-                    try:
-                        await asyncio.wait_for(
-                            self._session.approval_event.wait(),
-                            timeout=APPROVAL_TIMEOUT,
-                        )
-                    except asyncio.TimeoutError:
-                        yield ToolCallEvent(type="error", error="Approval timeout — agent stopped.")
-                        self._session.status = "stopped"
-                        return
-
-                    action = self._session.approved_action
-                    if action == "stop":
-                        yield ToolCallEvent(type="done", content="Stopped by user.", changes=self._changes)
-                        self._session.status = "stopped"
-                        return
-                    if action == "skip":
-                        tool_result = "skipped by user"
-                        if fn_name in ("write_file", "edit_file"):
-                            # Patch args so the LLM knows which file was skipped
-                            pass
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": tool_result,
-                        })
-                        yield ToolCallEvent(type="tool_output", tool=fn_name, result=tool_result)
-                        continue
-                    if action == "edit" and self._session.edited_content is not None:
-                        # User provided edited content — substitute into args
-                        if fn_name in ("write_file", "edit_file"):
-                            fn_args = dict(fn_args)
-                            fn_args["content"] = self._session.edited_content
-                            if fn_name == "edit_file":
-                                # For edit_file, if user edits the whole new content we
-                                # switch to write_file semantics for the dry_run record
-                                fn_name = "write_file"
-
-                # Execute tool (with escalation on failure for mutating tools)
-                file_change = None
-                try:
-                    tool_result, file_change = await self._execute_tool(fn_name, fn_args)
-                except ToolExecutionError as tool_exc:
-                    plan_b_msg = ""
-                    if self._session and self._session.plan_b and not self._session.plan_b_exhausted:
-                        plan_b = self._session.plan_b
-                        plan_b_msg = f"\n\nPlan B is available. Switching approach: {plan_b.rationale}"
-
-                    async for evt in self._run_escalation(tool_exc, iteration):
-                        yield evt
-
-                    if self._session and self._session.status in ("stopped", "error"):
-                        return
-
-                    escalation_action = self._session.escalation_action if self._session else None
-                    if escalation_action == "stop":
-                        yield ToolCallEvent(type="done", content="Stopped after escalation.", changes=self._changes)
-                        if self._session:
-                            self._session.status = "stopped"
-                        return
-                    elif escalation_action == "manual_fix":
-                        tool_result = f"User applied manual fix for {tool_exc.fn_name}. Continuing."
-                    elif self._session and self._session.escalation_instruction:
-                        messages.append({
-                            "role": "user",
-                            "content": f"Previous attempt failed. User instruction: {self._session.escalation_instruction}{plan_b_msg}",
-                        })
-                        tool_result = f"Escalated — user provided alternative instruction."
-                        self._session.escalation_instruction = None
-                    else:
-                        tool_result = f"Tool failed (escalated): {tool_exc.error_message}.{plan_b_msg}"
-
-                if file_change:
-                    self._changes.append(file_change)
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": tool_result,
-                })
-                yield ToolCallEvent(
-                    type="tool_output",
-                    tool=fn_name,
-                    result=tool_result,
-                    diff=file_change.diff if file_change else None,
-                )
-
-        # Exceeded max iterations
-        yield ToolCallEvent(
-            type="done",
-            content=f"Reached maximum iterations ({MAX_ITERATIONS}).",
-            changes=self._changes,
-            summary=f"Completed {len(self._changes)} file changes.",
-        )
-        if self._session:
-            self._session.status = "complete"
+            # Chunk hit MAX_ITERATIONS — continue to next chunk with summary
+            if not chunk_completed:
+                prev_summary = f"Completed {len(self._changes)} file changes so far (hit iteration limit on phase {chunk_idx + 1})."
+                if chunk_idx == total_chunks - 1:
+                    yield ToolCallEvent(
+                        type="done",
+                        content=f"Reached maximum iterations ({MAX_ITERATIONS}).",
+                        changes=self._changes,
+                        summary=f"Completed {len(self._changes)} file changes.",
+                    )
+                    if self._session:
+                        self._session.status = "complete"
+                    return
 
     def _compute_preview_diff(self, fn_name: str, fn_args: Dict[str, Any]) -> str:
         """Compute a preview diff for write_file / edit_file without writing to disk."""

@@ -6,9 +6,13 @@ Only commands matching the ALLOWED_COMMANDS allowlist may be executed.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from typing import Dict, Any, List
+
+# Set AGENT_SHELL_UNRESTRICTED=true in .env to bypass the allowlist (dev only)
+SHELL_UNRESTRICTED = os.getenv("AGENT_SHELL_UNRESTRICTED", "").lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
 # Allowlist: each entry is a regex that the *full* command string must match
@@ -35,6 +39,14 @@ ALLOWED_COMMANDS: List[str] = [
     r"pyright(\s|$)",
     # Git read-only
     r"git\s+(status|diff|log|show|blame)(\s|$)",
+    # File exploration (read-only)
+    r"find(\s|$)",
+    r"ls(\s|$)",
+    r"cat(\s|$)",
+    r"head(\s|$)",
+    r"tail(\s|$)",
+    r"wc(\s|$)",
+    r"grep(\s|$)",
 ]
 
 # Commands allowed when prefixed with "cd <path> && <cmd>"
@@ -44,6 +56,8 @@ _COMPILED: List[re.Pattern] = [re.compile(p) for p in ALLOWED_COMMANDS]
 
 def _is_allowed(cmd: str) -> bool:
     """Return True if *cmd* (or its cd-prefix variant) matches ALLOWED_COMMANDS."""
+    if SHELL_UNRESTRICTED:
+        return True
     stripped = cmd.strip()
     # Strip optional "cd <path> && " prefix so agent can run commands in subdirs
     m = _CD_PREFIX.match(stripped)

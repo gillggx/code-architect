@@ -107,6 +107,7 @@ const TopBar: React.FC = () => {
   const clearModules = useAppStore((s) => s.clearModules);
   const setPatterns = useAppStore((s) => s.setPatterns);
   const setFilesTotal = useAppStore((s) => s.setFilesTotal);
+  const setFilesAnalyzed = useAppStore((s) => s.setFilesAnalyzed);
   const incrementFilesAnalyzed = useAppStore((s) => s.incrementFilesAnalyzed);
   const resetProgress = useAppStore((s) => s.resetProgress);
   const { addChatMessage, updateLastAssistantMessage, setChatStreaming } = useChat();
@@ -189,9 +190,32 @@ const TopBar: React.FC = () => {
       allPatternsRef.current = [];
       setFileTree([]);
       setPatterns([]);
-      if (scanInfo) setFilesTotal(Math.min(scanInfo.analyzable, 40));
+      if (scanInfo) setFilesTotal(scanInfo.analyzable);
 
       setSelectedProject({ path: projectPath, id: projectId });
+
+      // Load existing memory from disk so user sees past analysis immediately
+      fetch(`/api/memory/${projectId}`)
+        .then(r => r.json())
+        .then(data => {
+          if (data.modules?.length > 0) {
+            data.modules.forEach((m: any) => addModule({
+              name: m.name ?? m.path?.split('/').pop() ?? 'module',
+              path: m.path ?? '',
+              purpose: m.purpose ?? '',
+              patterns: m.patterns ?? [],
+              key_components: m.key_components ?? [],
+            }));
+            // Reflect loaded modules in progress bar
+            setFilesAnalyzed(data.modules.length);
+            if (data.modules.length > (scanInfo?.analyzable ?? 0)) {
+              setFilesTotal(data.modules.length);
+            }
+          }
+          if (data.patterns?.length > 0) setPatterns(data.patterns);
+        })
+        .catch(() => {/* no memory yet */});
+
       setShowModal(false);
       setInputPath('');
       setScanInfo(null);

@@ -12,17 +12,27 @@ An AI-powered codebase analysis and agentic coding tool. Point it at any project
 - **File scanning** — AST-level structure extraction (no LLM cost)
 - **LLM-powered reading** — builds structured memory of modules, patterns, dependencies
 - **Incremental re-analysis** — only changed/new files are re-processed (MD5 + mtime snapshots)
+- **Chunked analysis** — large files are read in chunks with rolling memory accumulation; no timeout from oversized files
+- **Incremental persistence** — modules.json and SNAPSHOTS.json saved after every file so interrupted analyses are never lost
+- **Memory consistency check** — auto-detects snapshot/module mismatch and triggers full re-analysis
 - **Real-time activity feed** — every file read and summary written shown live
 
 ### Chat
 - **RAG-powered Q&A** — answers grounded in architecture memory via hybrid BM25 + vector search
 - **3-tier memory** — hot cache → Markdown summaries → vector embeddings
+- **Persistent memory display** — past analysis results loaded into Memory panel on project select
+- **Git context injection** — recent commits and uncommitted changes injected into chat so agent knows what was recently worked on
+- **Analysis-in-progress awareness** — chat agent warns when memory is incomplete during active analysis
 
-### Agentic Mode
+### Agentic Mode (Edit)
 - **SOUL.md** — per-project personality and constraints injected into agent system prompt
-- **Plan A / Plan B** — LLM generates two execution plans with confidence scores; low-confidence gap triggers human approval
+- **Plan A / Plan B** — LLM generates execution plans with confidence scores; `response_format: json_object` ensures reliable JSON output across weak models
+- **Automatic task chunking** — large plans (>12 steps) split into phases automatically; each phase carries summary context from the previous
+- **Chat history injection** — recent chat conversation sent with edit tasks so agent understands context
 - **Escalation Loop** — tool failure → auto-switch to Plan B → human escalation with custom instruction
 - **Built-in tools** — read/write/edit files, git status/diff, shell commands, code search
+- **Shell allowlist** — test runners, linters, git, find, ls, cat, grep; bypass with `AGENT_SHELL_UNRESTRICTED=true`
+- **40-iteration limit** — per phase, so large multi-phase tasks are not cut off
 
 ### A2A API
 - **Architecture query** — `POST /api/a2a/query` — other agents can ask architecture questions
@@ -38,6 +48,8 @@ An AI-powered codebase analysis and agentic coding tool. Point it at any project
 |---------|------|
 | Backend (FastAPI) | **8001** |
 | Frontend (Vite/React) | **3001** |
+
+Designed to run alongside [agent-platform](https://github.com/gillggx/agent-platform) (ports 8080/2999) on the same machine without conflicts.
 
 ---
 
@@ -62,6 +74,9 @@ cp .env.example .env   # then set OPENROUTER_API_KEY
 ```env
 OPENROUTER_API_KEY=sk-or-...
 DEFAULT_LLM_MODEL=anthropic/claude-haiku-4-5
+
+# Optional: bypass shell command allowlist (dev only)
+# AGENT_SHELL_UNRESTRICTED=true
 ```
 
 ### 2. Start
@@ -82,15 +97,16 @@ Opens:
 code-architect/
 ├── src/architect/
 │   ├── api/           # FastAPI routes, agent runner, tools, SOUL loader
-│   ├── analysis/      # LLM file analyzer, large project handler
-│   ├── llm/           # LLM client, model router, chat engine
+│   │   └── tools/     # file_tools, shell_tools (with allowlist)
+│   ├── analysis/      # LLM file analyzer (chunked), large project handler
+│   ├── llm/           # LLM client, model router, chat engine (git context)
 │   ├── memory/        # 3-tier memory (hot cache, markdown, vectors)
 │   ├── patterns/      # Design pattern detector
 │   ├── projects/      # Project manager
 │   └── rag/           # Hybrid BM25 + vector search
 ├── web/               # React + TypeScript frontend
 │   └── src/
-│       ├── components/ # FileTree, AgentActivityFeed, ChatBar, PlanCard, EscalationCard
+│       ├── components/ # FileTree, AgentActivityFeed, ChatBar, PlanCard, EscalationCard, MemoryPanel
 │       └── store/      # Zustand app state
 ├── start.sh           # One-command start
 └── .env               # API keys and model selection
@@ -137,6 +153,20 @@ Response:
 }
 ```
 
+The edit agent also accepts `chat_history` for context:
+
+```json
+{
+  "task": "Add error handling to the login flow",
+  "project_id": "my-project",
+  "mode": "interactive",
+  "chat_history": [
+    {"role": "user", "content": "The login flow crashes on invalid tokens"},
+    {"role": "assistant", "content": "I can see the issue in auth/jwt.py..."}
+  ]
+}
+```
+
 ---
 
 ## Environment Variables
@@ -144,6 +174,7 @@ Response:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENROUTER_API_KEY` | — | Required for cloud LLMs |
-| `DEFAULT_LLM_MODEL` | `anthropic/claude-haiku-4-5` | Model for analysis and chat |
+| `DEFAULT_LLM_MODEL` | `anthropic/claude-haiku-4-5` | Model for analysis, chat, and edit agent |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter endpoint |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama fallback |
+| `AGENT_SHELL_UNRESTRICTED` | `false` | Bypass shell command allowlist (dev only) |

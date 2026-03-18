@@ -159,6 +159,7 @@ interface AppStore {
   filesTotal: number;
   filesAnalyzed: number;
   setFilesTotal: (n: number) => void;
+  setFilesAnalyzed: (n: number) => void;
   incrementFilesAnalyzed: () => void;
   resetProgress: () => void;
 
@@ -243,6 +244,7 @@ export const useAppStore = create<AppStore>((set) => ({
   filesTotal: 0,
   filesAnalyzed: 0,
   setFilesTotal: (n) => set({ filesTotal: n }),
+  setFilesAnalyzed: (n) => set({ filesAnalyzed: n }),
   incrementFilesAnalyzed: () => set((s) => ({ filesAnalyzed: s.filesAnalyzed + 1 })),
   resetProgress: () => set({ filesTotal: 0, filesAnalyzed: 0 }),
 
@@ -376,9 +378,10 @@ export const useJob = () => {
   const filesTotal = useAppStore((s) => s.filesTotal);
   const filesAnalyzed = useAppStore((s) => s.filesAnalyzed);
   const setFilesTotal = useAppStore((s) => s.setFilesTotal);
+  const setFilesAnalyzed = useAppStore((s) => s.setFilesAnalyzed);
   const incrementFilesAnalyzed = useAppStore((s) => s.incrementFilesAnalyzed);
   const resetProgress = useAppStore((s) => s.resetProgress);
-  return { currentJob, setCurrentJob, filesTotal, filesAnalyzed, setFilesTotal, incrementFilesAnalyzed, resetProgress };
+  return { currentJob, setCurrentJob, filesTotal, filesAnalyzed, setFilesTotal, setFilesAnalyzed, incrementFilesAnalyzed, resetProgress };
 };
 
 export const useUI = () => {

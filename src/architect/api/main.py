@@ -272,6 +272,13 @@ def create_app(debug: bool = False) -> FastAPI:
                     "summary": event.summary,
                     "data": event.data,
                 }
+                # Track progress so chat can report analysis status
+                if event.type == "done" and event.file:
+                    async with _app_state._lock:
+                        job = _app_state.active_jobs.get(job_id, {})
+                        job["files_analyzed"] = job.get("files_analyzed", 0) + 1
+                        if event.data and isinstance(event.data, dict):
+                            job["total_files"] = event.data.get("total_files", job.get("total_files", 0))
                 ws_msg = WebSocketMessage(
                     type="agent_event",
                     job_id=job_id,
@@ -596,10 +603,45 @@ def create_app(debug: bool = False) -> FastAPI:
 
         session = get_or_create_session(request.session_id, request.project_id)
 
+        # Check if analysis is still running for this project
+        analysis_status = None
+        if request.project_id:
+            for job in _app_state.active_jobs.values():
+                if job.get("project_id") == request.project_id and job.get("status") == "running":
+                    analyzed = job.get("files_analyzed", 0)
+                    total = job.get("total_files", 0)
+                    analysis_status = f"Analysis in progress ({analyzed}/{total} files analyzed). Memory is incomplete — tell the user to wait for analysis to finish before asking questions."
+                    break
+
+        # Inject recent git context so agent knows what was recently changed
+        import subprocess as _sp
+        recent_changes = None
+        project_path = _resolve_project_path(request.project_id) if request.project_id else None
+        if project_path and os.path.isdir(os.path.join(project_path, ".git")):
+            try:
+                git_log = _sp.run(
+                    ["git", "log", "--oneline", "-10"],
+                    cwd=project_path, capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+                git_status = _sp.run(
+                    ["git", "status", "--short"],
+                    cwd=project_path, capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+                if git_log or git_status:
+                    recent_changes = ""
+                    if git_status:
+                        recent_changes += f"Uncommitted changes:\n{git_status}\n\n"
+                    if git_log:
+                        recent_changes += f"Recent commits:\n{git_log}"
+            except Exception:
+                pass
+
         async def event_stream():
             try:
                 async for chunk in _app_state.chat_engine.stream_chat(
-                    session, request.message
+                    session, request.message,
+                    analysis_status=analysis_status,
+                    recent_changes=recent_changes,
                 ):
                     payload = json.dumps({"type": "chunk", "data": chunk})
                     yield f"data: {payload}\n\n"
@@ -752,6 +794,7 @@ def create_app(debug: bool = False) -> FastAPI:
                 mode="interactive",
                 context=request.context,
                 session_id=session_id,
+                chat_history=request.chat_history or [],
             )
 
             async def sse_stream():
@@ -773,6 +816,7 @@ def create_app(debug: bool = False) -> FastAPI:
             project_modules=project_modules,
             mode=request.mode,
             context=request.context,
+            chat_history=request.chat_history or [],
         )
 
         explanation = ""
@@ -1030,6 +1074,20 @@ def create_app(debug: bool = False) -> FastAPI:
                 if os.path.splitext(f)[1].lower() in SOURCE_EXTENSIONS:
                     analyzable += 1
         return {"total_files": total, "analyzable_files": analyzable, "path": abs_path}
+
+    @app.get("/api/memory/{project_id}", tags=["memory"], summary="Load persisted memory for a project")
+    async def get_project_memory(project_id: str) -> dict:
+        """Return saved modules and patterns for a project from disk."""
+        import json as _json
+        modules = _load_project_modules(project_id)
+        patterns: list = []
+        patterns_path = os.path.join("architect_memory", project_id, "patterns.json")
+        if os.path.exists(patterns_path):
+            try:
+                patterns = _json.load(open(patterns_path))
+            except Exception:
+                pass
+        return {"modules": modules, "patterns": patterns, "count": len(modules)}
 
     @app.get("/api/native-pick", tags=["filesystem"], summary="Open native OS folder picker")
     async def native_pick_folder() -> dict:

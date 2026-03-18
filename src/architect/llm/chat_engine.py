@@ -90,6 +90,8 @@ class ChatEngine:
         self,
         session: ChatSession,
         user_message: str,
+        analysis_status: Optional[str] = None,
+        recent_changes: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """
         Stream LLM response for user_message.
@@ -104,7 +106,7 @@ class ChatEngine:
         context = await self._retrieve_context(user_message, session.project_id)
 
         # 2. Build message list
-        messages = self._build_messages(session, user_message, context)
+        messages = self._build_messages(session, user_message, context, analysis_status=analysis_status, recent_changes=recent_changes)
 
         # 3. Route to model
         decision = self.router.route(user_message)
@@ -192,10 +194,12 @@ class ChatEngine:
         session: ChatSession,
         user_message: str,
         context: Dict[str, Any],
+        analysis_status: Optional[str] = None,
+        recent_changes: Optional[str] = None,
     ) -> list[dict]:
         """Assemble the OpenAI-style message list for the LLM."""
 
-        system_prompt = self._build_system_prompt(session.project_id, context)
+        system_prompt = self._build_system_prompt(session.project_id, context, analysis_status=analysis_status, recent_changes=recent_changes)
 
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
@@ -224,6 +228,8 @@ class ChatEngine:
         self,
         project_id: Optional[str],
         context: Dict[str, Any],
+        analysis_status: Optional[str] = None,
+        recent_changes: Optional[str] = None,
     ) -> str:
         """Build system prompt with retrieved code context."""
 
@@ -238,6 +244,15 @@ class ChatEngine:
             soul,
             "",
         ]
+
+        if analysis_status:
+            lines.append(f"## ⚠️ IMPORTANT: {analysis_status}")
+            lines.append("")
+
+        if recent_changes:
+            lines.append("## Recent Git Activity (what was recently worked on)")
+            lines.append(recent_changes)
+            lines.append("")
 
         if project_id:
             lines.append(f"Current project: {project_id}")

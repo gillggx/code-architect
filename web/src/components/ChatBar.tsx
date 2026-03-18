@@ -9,7 +9,7 @@ import React, { useState, useRef } from 'react';
 import { useChat, useUI, useJob, useAppStore } from '../store/app';
 
 const ChatBar: React.FC = () => {
-  const { addChatMessage, updateLastAssistantMessage, isChatStreaming, setChatStreaming } = useChat();
+  const { addChatMessage, updateLastAssistantMessage, isChatStreaming, setChatStreaming, chatMessages } = useChat();
   const { selectedProject } = useUI();
   const { currentJob } = useJob();
   const setCenterTab = useAppStore(s => s.setCenterTab);
@@ -130,6 +130,12 @@ const ChatBar: React.FC = () => {
     abortRef.current = ctrl;
 
     try {
+      // Send last 10 completed chat messages as context (skip streaming ones)
+      const historyToSend = chatMessages
+        .filter(m => !m.streaming && m.content)
+        .slice(-10)
+        .map(m => ({ role: m.role, content: m.content }));
+
       const res = await fetch('/api/a2a/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -137,6 +143,7 @@ const ChatBar: React.FC = () => {
           task: text,
           project_id: selectedProject.id,
           mode: 'interactive',
+          chat_history: historyToSend,
         }),
         signal: ctrl.signal,
       });

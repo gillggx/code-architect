@@ -496,6 +496,10 @@ class GenerateRequest(BaseModel):
         description="Execution mode: dry_run | apply | interactive",
     )
     context: Optional[str] = Field(None, description="Additional context for agent")
+    chat_history: Optional[List[Dict[str, str]]] = Field(
+        None,
+        description="Recent chat messages [{role, content}] for agent context",
+    )
 
 
 class FileChangeSchema(BaseModel):

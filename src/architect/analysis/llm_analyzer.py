@@ -153,7 +153,7 @@ LANGUAGE_MAP: dict[str, str] = {
     ".md": "Markdown",
 }
 
-MAX_FILES = 40
+MAX_FILES = None  # No limit — analyze all files
 MAX_CONTENT_CHARS = 8_000
 
 
@@ -258,6 +258,31 @@ class LLMAnalyzer:
         old_snapshot: Optional[ProjectSnapshot] = None
         if memory_dir:
             old_snapshot = await detector.load_snapshot(memory_dir)
+
+            # Sanity check: if snapshot claims many files done but modules.json
+            # has far fewer entries, the memory is corrupt — force full re-analysis
+            if old_snapshot and old_snapshot.file_snapshots:
+                modules_path = os.path.join(memory_dir, "modules.json")
+                modules_count = 0
+                if os.path.exists(modules_path):
+                    try:
+                        import json as _json2
+                        modules_count = len(_json2.load(open(modules_path)))
+                    except Exception:
+                        pass
+                snap_count = len(old_snapshot.file_snapshots)
+                if snap_count > 0 and modules_count < snap_count:
+                    # More than half the snapshotted files have no module entry
+                    logger.warning(
+                        "Memory mismatch: %d snapshots but only %d modules — clearing snapshot for full re-analysis",
+                        snap_count, modules_count,
+                    )
+                    await self._emit(AgentEvent(
+                        type="scan",
+                        message=f"Memory inconsistent ({snap_count} snapshots, {modules_count} modules) — re-analyzing all files.",
+                    ))
+                    old_snapshot = None  # force full re-analysis
+
             if old_snapshot:
                 # Build current snapshot only for files in priority list
                 import time as _time
@@ -311,35 +336,41 @@ class LLMAnalyzer:
         modules: List[dict] = []
         all_patterns_seen: List[str] = []
 
+        # Build snapshot dict in memory; flush to disk after each file (no repeated loads)
+        from ..memory.incremental_analysis import FileSnapshot as _FileSnapshot
+        from ..memory.incremental_analysis import ProjectSnapshot as _ProjectSnapshot
+        import json as _json_inc
+        import time as _time
+        running_snaps = dict(old_snapshot.file_snapshots) if old_snapshot else {}
+
         for idx, file_path in enumerate(priority_files, 1):
             logger.info("Analyzing file %d/%d: %s", idx, len(priority_files), file_path)
             result = await self._analyze_file(file_path, project_path)
             if result is not None:
                 modules.append(result)
                 all_patterns_seen.extend(result.get("patterns", []))
-                # Save incremental snapshot after each file so progress survives interruptions.
-                # We only record files we've ACTUALLY analyzed, not the whole project.
+                # Save incremental snapshot + modules after each file so progress
+                # survives interruptions. Both must stay in sync.
                 if memory_dir:
                     try:
-                        existing = await detector.load_snapshot(memory_dir)
-                        snaps = dict(existing.file_snapshots) if existing else {}
                         stat = os.stat(file_path)
-                        from ..memory.incremental_analysis import FileSnapshot as _FileSnapshot
-                        import time as _time
-                        snaps[file_path] = _FileSnapshot(
+                        running_snaps[file_path] = _FileSnapshot(
                             path=file_path,
                             mtime=stat.st_mtime,
                             size=stat.st_size,
                         )
-                        from ..memory.incremental_analysis import ProjectSnapshot as _ProjectSnapshot
                         partial_snap = _ProjectSnapshot(
                             project_path=project_path,
                             analyzed_at=_time.time(),
-                            file_snapshots=snaps,
+                            file_snapshots=running_snaps,
                         )
                         await detector.save_snapshot(partial_snap, memory_dir)
+
+                        modules_path_inc = os.path.join(memory_dir, "modules.json")
+                        with open(modules_path_inc, "w") as _mf:
+                            _json_inc.dump(modules, _mf, ensure_ascii=False, indent=2)
                     except Exception as _exc:
-                        logger.warning("Failed to save incremental snapshot: %s", _exc)
+                        logger.warning("Failed to save incremental snapshot/modules: %s", _exc)
 
         # Deduplicate patterns while preserving order
         seen: set[str] = set()
@@ -458,7 +489,7 @@ class LLMAnalyzer:
             + sorted(rest)
         )
 
-        return ordered[:MAX_FILES]
+        return ordered if MAX_FILES is None else ordered[:MAX_FILES]
 
     def _count_imports(self, file_path: str) -> int:
         """Count import/require statements as a quick proxy for file centrality."""
@@ -493,12 +524,10 @@ class LLMAnalyzer:
         """
         filename = Path(file_path).name
 
-        # --- Read content ---
+        # --- Read content (full file, no hard cap) ---
         try:
             with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
-                content = fh.read(MAX_CONTENT_CHARS)
-            if len(content) == MAX_CONTENT_CHARS:
-                content += "\n... [truncated]"
+                content = fh.read()
         except OSError as exc:
             await self._emit(AgentEvent(
                 type="error",
@@ -507,35 +536,71 @@ class LLMAnalyzer:
             ))
             return None
 
-        # --- Emit llm_start ---
+        # --- Chunked analysis for large files ---
+        chunks = [content[i:i + MAX_CONTENT_CHARS] for i in range(0, len(content), MAX_CONTENT_CHARS)]
+        total_chunks = len(chunks)
+
         await self._emit(AgentEvent(
             type="llm_start",
-            message=f"Reading {filename}...",
+            message=f"Reading {filename}..." if total_chunks == 1 else f"Reading {filename} ({total_chunks} chunks)...",
             file=file_path,
         ))
 
-        # --- Build prompt and call LLM ---
-        prompt = self._build_file_prompt(file_path, content)
-        messages = [{"role": "user", "content": prompt}]
+        memory: dict = {"purpose": "", "key_components": [], "dependencies": [], "patterns": [], "notes": []}
+        raw_response = ""
 
-        try:
-            raw_response = await asyncio.wait_for(
-                self._llm.complete(messages),
-                timeout=90.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("LLM call timed out for %s (90s), skipping", file_path)
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            if total_chunks > 1:
+                await self._emit(AgentEvent(
+                    type="llm_start",
+                    message=f"  {filename} chunk {chunk_index}/{total_chunks}...",
+                    file=file_path,
+                ))
+
+            if total_chunks == 1:
+                prompt = self._build_file_prompt(file_path, chunk)
+            else:
+                prompt = self._build_chunk_prompt(file_path, chunk, chunk_index, total_chunks, memory)
+
+            try:
+                raw_response = await asyncio.wait_for(
+                    self._llm.complete([{"role": "user", "content": prompt}]),
+                    timeout=90.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("LLM call timed out for %s chunk %d (90s), skipping chunk", file_path, chunk_index)
+                await self._emit(AgentEvent(
+                    type="error",
+                    message=f"Timeout on {filename} chunk {chunk_index}/{total_chunks}, skipping chunk.",
+                    file=file_path,
+                ))
+                continue  # skip this chunk, carry on with what we have
+
+            # Merge chunk result into memory for next chunk
+            try:
+                parsed = self._parse_llm_response(raw_response)
+                if parsed.get("purpose"):
+                    memory["purpose"] = parsed["purpose"]
+                for key in ("key_components", "dependencies", "patterns", "notes"):
+                    existing = memory.get(key, [])
+                    new_items = parsed.get(key, [])
+                    if isinstance(new_items, list):
+                        seen = set(existing)
+                        memory[key] = existing + [x for x in new_items if x not in seen]
+                    elif isinstance(new_items, str) and new_items:
+                        memory[key] = existing + [new_items]
+            except Exception:
+                pass  # keep existing memory if parse fails
+
+        # Use merged memory as the final raw_response for downstream parsing
+        import json as _json
+        raw_response = _json.dumps(memory)
+
+        # If we got nothing useful from all chunks, skip this file
+        if not memory.get("purpose"):
             await self._emit(AgentEvent(
                 type="error",
-                message=f"Timeout (90s) reading {filename}, skipping.",
-                file=file_path,
-            ))
-            return None
-        except Exception as exc:
-            logger.error("LLM call failed for %s: %s", file_path, exc)
-            await self._emit(AgentEvent(
-                type="error",
-                message=f"LLM error on {filename}: {exc}",
+                message=f"Could not analyze {filename} (all chunks failed), skipping.",
                 file=file_path,
             ))
             return None
@@ -591,14 +656,8 @@ class LLMAnalyzer:
     # ------------------------------------------------------------------
 
     def _build_file_prompt(self, file_path: str, content: str) -> str:
-        """
-        Build the analysis prompt for a single file.
-
-        Returns a string that asks the LLM for a JSON-structured summary.
-        """
+        """Build the analysis prompt for a single file (small files only)."""
         language = self._detect_language(file_path)
-        path_display = file_path
-
         return (
             f"Analyze this {language} file. "
             "Return a JSON with keys: "
@@ -607,7 +666,40 @@ class LLMAnalyzer:
             "dependencies (list of imports), "
             "patterns (list of design patterns spotted), "
             "notes (any important observations). "
-            f"File: {path_display}\n\n{content}"
+            f"File: {file_path}\n\n{content}"
+        )
+
+    def _build_chunk_prompt(
+        self,
+        file_path: str,
+        chunk: str,
+        chunk_index: int,
+        total_chunks: int,
+        memory: dict,
+    ) -> str:
+        """Build a prompt for one chunk of a large file, carrying accumulated memory."""
+        language = self._detect_language(file_path)
+        memory_str = (
+            f"So far from previous chunks:\n"
+            f"- Purpose: {memory.get('purpose', 'unknown')}\n"
+            f"- Components found: {', '.join(memory.get('key_components', [])) or 'none yet'}\n"
+            f"- Dependencies: {', '.join(memory.get('dependencies', [])) or 'none yet'}\n"
+            f"- Patterns: {', '.join(memory.get('patterns', [])) or 'none yet'}\n"
+        ) if chunk_index > 1 else ""
+
+        instruction = (
+            "Summarize your full understanding into the final JSON."
+            if chunk_index == total_chunks
+            else "Update the running analysis with anything new you find. Return JSON only."
+        )
+
+        return (
+            f"You are incrementally analyzing a large {language} file ({file_path}). "
+            f"This is chunk {chunk_index}/{total_chunks}.\n"
+            f"{memory_str}\n"
+            f"Chunk content:\n{chunk}\n\n"
+            f"Return JSON with keys: purpose, key_components, dependencies, patterns, notes. "
+            f"{instruction}"
         )
 
     # ------------------------------------------------------------------
