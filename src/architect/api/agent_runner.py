@@ -481,45 +481,39 @@ class AgentRunner:
                 lines.append(f"- {name}: {purpose}")
             module_summary = "\n".join(lines)
 
-        planning_prompt = f"""You are a software engineering planner.
-Given the task and project context, generate an execution plan.
+        # Truncate task to avoid token overflow in planning call
+        task_summary = self.task[:800] if len(self.task) > 800 else self.task
+
+        system_msg = "You are a software engineering planner. You output ONLY valid JSON, no explanation, no markdown fences."
+        user_msg = f"""Generate an execution plan for this task.
 
 Project modules:
 {module_summary}
 
-Task: {self.task}
+Task:
+{task_summary}
 
-Respond with ONLY valid JSON in this exact format:
-{{
-  "plan_a": {{
-    "steps": [{{"index": 1, "description": "...", "files_affected": ["file.py"]}}, ...],
-    "confidence": 0.85,
-    "rationale": "Primary approach because ...",
-    "risk_level": "low"
-  }},
-  "plan_b": {{
-    "steps": [{{"index": 1, "description": "...", "files_affected": ["file.py"]}}, ...],
-    "confidence": 0.60,
-    "rationale": "Fallback if primary fails because ...",
-    "risk_level": "medium"
-  }}
-}}
+Output ONLY this JSON structure (no other text):
+{{"plan_a":{{"steps":[{{"index":1,"description":"...","files_affected":["file.py"]}}],"confidence":0.8,"rationale":"...","risk_level":"low"}},"plan_b":{{"steps":[{{"index":1,"description":"...","files_affected":[]}}],"confidence":0.5,"rationale":"...","risk_level":"medium"}}}}
 
 Rules:
-- plan_b is optional; omit it if there's only one sensible approach
-- confidence is 0.0-1.0
-- risk_level is "low", "medium", or "high"
-- steps should be concrete and specific
-- Respond with ONLY the JSON, no explanation"""
+- confidence: 0.0-1.0 float
+- risk_level: "low" | "medium" | "high"
+- plan_b key may be omitted if only one approach exists
+- steps must be concrete and actionable"""
 
         try:
             response = await client.chat.completions.create(
                 model=AGENT_MODEL,
-                messages=[{"role": "user", "content": planning_prompt}],
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
                 max_tokens=1024,
-                temperature=0.3,
+                temperature=0.2,
             )
             raw = response.choices[0].message.content or ""
+            logger.debug("Plan LLM raw response: %s", raw[:500])
             # Extract JSON — find the outermost { } block robustly
             import re as _re
             data = None
@@ -567,7 +561,7 @@ Rules:
             return plan_a, plan_b
 
         except Exception as exc:
-            logger.warning("Plan generation failed: %s — using default plan", exc)
+            logger.warning("Plan generation failed: %s — raw was: %r — using default plan", exc, locals().get('raw', '')[:300])
             default_plan = ExecutionPlan(
                 variant="A",
                 steps=[PlanStep(index=1, description=self.task, files_affected=[])],
