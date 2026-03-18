@@ -1061,7 +1061,7 @@ def create_app(debug: bool = False) -> FastAPI:
     @app.get("/api/scan", tags=["filesystem"], summary="Quick file count before analysis")
     async def scan_project(path: str) -> dict:
         """Scan a directory and return file counts without running LLM analysis."""
-        from ..analysis.llm_analyzer import SKIP_DIRS, SOURCE_EXTENSIONS
+        from ..analysis.llm_analyzer import SKIP_DIRS, SKIP_FILES, SOURCE_EXTENSIONS
         abs_path = os.path.abspath(os.path.expanduser(path))
         if not os.path.isdir(abs_path):
             raise ValidationError(f"Not a directory: {path}", field="path")
@@ -1071,7 +1071,7 @@ def create_app(debug: bool = False) -> FastAPI:
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
             for f in files:
                 total += 1
-                if os.path.splitext(f)[1].lower() in SOURCE_EXTENSIONS:
+                if f not in SKIP_FILES and os.path.splitext(f)[1].lower() in SOURCE_EXTENSIONS:
                     analyzable += 1
         return {"total_files": total, "analyzable_files": analyzable, "path": abs_path}
 
