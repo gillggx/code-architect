@@ -123,6 +123,14 @@ export interface AnalysisJob {
   ws?: WebSocket;
 }
 
+export interface ProjectRecord {
+  project_id: string;
+  project_path: string;
+  project_name: string;
+  last_analyzed: string | null;
+  module_count: number;
+}
+
 // ---------------------------------------------------------------------------
 // Store interface
 // ---------------------------------------------------------------------------
@@ -201,6 +209,28 @@ interface AppStore {
   setCurrentPlan: (plan: PlanInfo | null) => void;
   escalation: EscalationInfo | null;
   setEscalation: (e: EscalationInfo | null) => void;
+
+  // App view (home vs workspace)
+  appView: 'home' | 'workspace';
+  setAppView: (v: 'home' | 'workspace') => void;
+
+  // New project flow
+  newProjectStep: 'idle' | 'chatting' | 'spec_ready' | 'building';
+  setNewProjectStep: (s: 'idle' | 'chatting' | 'spec_ready' | 'building') => void;
+  newProjectSpec: string | null;
+  setNewProjectSpec: (s: string | null) => void;
+  newProjectMessages: ChatMessage[];
+  addNewProjectMessage: (m: ChatMessage) => void;
+  updateLastNewProjectMessage: (chunk: string) => void;
+  clearNewProjectMessages: () => void;
+
+  // Project list
+  projectsList: ProjectRecord[];
+  setProjectsList: (p: ProjectRecord[]) => void;
+
+  // Pending analyze path (from ProjectManager -> TopBar)
+  pendingAnalyzePath: string | null;
+  setPendingAnalyzePath: (p: string | null) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -276,9 +306,14 @@ export const useAppStore = create<AppStore>((set) => ({
   isChatStreaming: false,
   setChatStreaming: (v) => set({ isChatStreaming: v }),
 
-  // Selected project
+  // Selected project — automatically switches appView
   selectedProject: null,
-  setSelectedProject: (p) => set({ selectedProject: p }),
+  setSelectedProject: (p) =>
+    set({
+      selectedProject: p,
+      appView: p ? 'workspace' : 'home',
+      ...(p ? {} : { newProjectStep: 'idle' }),
+    }),
 
   // UI
   darkMode: false,
@@ -305,6 +340,47 @@ export const useAppStore = create<AppStore>((set) => ({
   setCurrentPlan: (plan) => set({ currentPlan: plan }),
   escalation: null,
   setEscalation: (e) => set({ escalation: e }),
+
+  // App view
+  appView: 'home',
+  setAppView: (v) => set({ appView: v }),
+
+  // New project flow
+  newProjectStep: 'idle',
+  setNewProjectStep: (s) => set({ newProjectStep: s }),
+  newProjectSpec: null,
+  setNewProjectSpec: (s) => set({ newProjectSpec: s }),
+  newProjectMessages: [],
+  addNewProjectMessage: (m) =>
+    set((s) => ({ newProjectMessages: [...s.newProjectMessages, m] })),
+  updateLastNewProjectMessage: (chunk) =>
+    set((s) => {
+      const msgs = [...s.newProjectMessages];
+      const lastIdx = msgs.length - 1;
+      if (lastIdx >= 0 && msgs[lastIdx].role === 'assistant') {
+        msgs[lastIdx] = {
+          ...msgs[lastIdx],
+          content: msgs[lastIdx].content + chunk,
+        };
+      } else {
+        msgs.push({
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: chunk,
+          streaming: true,
+        });
+      }
+      return { newProjectMessages: msgs };
+    }),
+  clearNewProjectMessages: () => set({ newProjectMessages: [] }),
+
+  // Project list
+  projectsList: [],
+  setProjectsList: (p) => set({ projectsList: p }),
+
+  // Pending analyze path
+  pendingAnalyzePath: null,
+  setPendingAnalyzePath: (p) => set({ pendingAnalyzePath: p }),
 }));
 
 // ---------------------------------------------------------------------------

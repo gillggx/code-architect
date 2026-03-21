@@ -460,39 +460,143 @@ def create_app(debug: bool = False) -> FastAPI:
     
     @app.get(
         "/api/projects",
-        response_model=ProjectListResponse,
         tags=["projects"],
         summary="List projects",
     )
-    async def list_projects(req: Request) -> ProjectListResponse:
-        """List all analyzed projects
-        
-        Args:
-            req: FastAPI request (for auth)
-        
-        Returns:
-            List of projects with metadata
+    async def list_projects(req: Request) -> dict:
+        """List all analyzed projects by reading from architect_memory/ directory."""
+        import json as _json
+        import shutil as _shutil
+
+        memory_base = "architect_memory"
+        results = []
+
+        if os.path.isdir(memory_base):
+            for entry in os.scandir(memory_base):
+                if not entry.is_dir():
+                    continue
+                project_id = entry.name
+                project_path_file = os.path.join(entry.path, "project_path.txt")
+                modules_file = os.path.join(entry.path, "modules.json")
+
+                if not os.path.exists(project_path_file):
+                    continue
+
+                try:
+                    with open(project_path_file) as pf:
+                        project_path = pf.read().strip()
+                except Exception:
+                    continue
+
+                module_count = 0
+                last_analyzed = None
+
+                if os.path.exists(modules_file):
+                    try:
+                        mtime = os.path.getmtime(modules_file)
+                        last_analyzed = datetime.utcfromtimestamp(mtime).isoformat() + "Z"
+                        with open(modules_file) as mf:
+                            modules_data = _json.load(mf)
+                            module_count = len(modules_data) if isinstance(modules_data, list) else 0
+                    except Exception:
+                        pass
+
+                project_name = project_path.rstrip("/").split("/")[-1] if project_path else project_id
+
+                results.append({
+                    "project_id": project_id,
+                    "project_path": project_path,
+                    "project_name": project_name,
+                    "last_analyzed": last_analyzed,
+                    "module_count": module_count,
+                })
+
+        # Sort by last_analyzed descending (None goes to end)
+        results.sort(key=lambda x: x["last_analyzed"] or "", reverse=True)
+
+        return {"projects": results, "total_count": len(results)}
+
+    @app.delete(
+        "/api/projects/{project_id}",
+        tags=["projects"],
+        summary="Delete a project's memory",
+    )
+    async def delete_project(project_id: str) -> dict:
+        """Remove the architect_memory/{project_id} directory."""
+        import shutil as _shutil
+        memory_dir = os.path.join("architect_memory", project_id)
+        if not os.path.isdir(memory_dir):
+            from .errors import NotFoundError
+            raise NotFoundError(f"Project not found: {project_id}", resource_type="project")
+        try:
+            _shutil.rmtree(memory_dir)
+        except Exception as exc:
+            raise InternalError(detail=f"Failed to delete project: {exc}") from exc
+        return {"deleted": project_id}
+
+    @app.post(
+        "/api/chat/new-project",
+        tags=["chat"],
+        summary="Chat to plan a new project (SSE streaming)",
+    )
+    async def chat_new_project(request: ChatRequest):
         """
-        # Check auth/rate limits
-        auth_middleware = get_auth_middleware()
-        api_key, description = await auth_middleware(req)
-        
-        # Simplified - would use actual project manager
-        projects = [
-            ProjectInfo(
-                project_id="project-1",
-                project_path="/path/to/project1",
-                created_at=datetime.utcnow() - timedelta(days=1),
-                last_analyzed=datetime.utcnow(),
-                languages=["python", "javascript"],
-                file_count=150,
-                pattern_count=8,
-            )
-        ]
-        
-        return ProjectListResponse(
-            projects=projects,
-            total_count=len(projects),
+        SSE streaming chat with a new-project planning system prompt.
+        Same format as /api/chat: {"type": "chunk"|"done"|"error", "data": "..."}
+        """
+        import json as _json
+
+        NEW_PROJECT_SYSTEM = (
+            "You are a software architect helping a user plan a new project.\n"
+            "Your job:\n"
+            "1. Ask clarifying questions (tech stack, features, scale, deployment) — 3-5 messages max\n"
+            "2. Once you have enough info, generate a complete project specification as a markdown document\n"
+            "3. Format the spec inside a special marker:\n\n"
+            "===SPEC_START===\n"
+            "# Project Spec: {name}\n"
+            "...full markdown spec...\n"
+            "===SPEC_END===\n\n"
+            "Keep the conversation focused. Be concise."
+        )
+
+        session = get_or_create_session(request.session_id, None)
+
+        async def event_stream():
+            try:
+                # Build messages with custom system prompt
+                messages = [{"role": "system", "content": NEW_PROJECT_SYSTEM}]
+                for m in session.history:
+                    messages.append({"role": m.role, "content": m.content})
+                messages.append({"role": "user", "content": request.message})
+
+                # Add user turn to session
+                session.add("user", request.message)
+
+                # Route model same as normal chat
+                decision = _app_state.chat_engine.router.route(request.message)
+                model = decision.primary_model
+
+                full_response = ""
+                async for chunk in _app_state.chat_engine.llm.stream(messages, model=model):
+                    full_response += chunk
+                    payload = _json.dumps({"type": "chunk", "data": chunk})
+                    yield f"data: {payload}\n\n"
+
+                # Save assistant response to session
+                session.add("assistant", full_response)
+                yield f"data: {_json.dumps({'type': 'done'})}\n\n"
+            except Exception as exc:
+                logger.error("new-project chat stream error: %s", exc)
+                payload = _json.dumps({"type": "error", "data": str(exc)})
+                yield f"data: {payload}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
         )
     
     # ========================================================================

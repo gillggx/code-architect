@@ -219,8 +219,9 @@ export class APIClient {
    *   Promise rejection with error details
    */
   private handleError(error: AxiosError): Promise<never> {
-    const message = error.response?.data?.detail || error.message;
-    const errorCode = error.response?.data?.error_code || 'UNKNOWN_ERROR';
+    const data = error.response?.data as Record<string, unknown> | undefined;
+    const message = (data?.detail as string) || error.message;
+    const errorCode = (data?.error_code as string) || 'UNKNOWN_ERROR';
 
     console.error(`API Error [${errorCode}]: ${message}`);
     return Promise.reject({

@@ -97,6 +97,7 @@ const TopBar: React.FC = () => {
   const setDarkMode = useAppStore((s) => s.setDarkMode);
   const selectedProject = useAppStore((s) => s.selectedProject);
   const setSelectedProject = useAppStore((s) => s.setSelectedProject);
+  const appView = useAppStore((s) => s.appView);
   const setCurrentJob = useAppStore((s) => s.setCurrentJob);
   const currentJob = useAppStore((s) => s.currentJob);
   const addEvent = useAppStore((s) => s.addEvent);
@@ -110,6 +111,8 @@ const TopBar: React.FC = () => {
   const setFilesAnalyzed = useAppStore((s) => s.setFilesAnalyzed);
   const incrementFilesAnalyzed = useAppStore((s) => s.incrementFilesAnalyzed);
   const resetProgress = useAppStore((s) => s.resetProgress);
+  const pendingAnalyzePath = useAppStore((s) => s.pendingAnalyzePath);
+  const setPendingAnalyzePath = useAppStore((s) => s.setPendingAnalyzePath);
   const { addChatMessage, updateLastAssistantMessage, setChatStreaming } = useChat();
   const chatSessionIdRef = useRef<string>(crypto.randomUUID());
 
@@ -128,6 +131,14 @@ const TopBar: React.FC = () => {
     fileListRef.current = state.fileTree;
     allPatternsRef.current = state.allPatterns;
   });
+
+  // Watch pendingAnalyzePath from ProjectManager
+  useEffect(() => {
+    if (!pendingAnalyzePath) return;
+    setInputPath(pendingAnalyzePath);
+    setPendingAnalyzePath(null);
+    setShowModal(true);
+  }, [pendingAnalyzePath, setPendingAnalyzePath]);
 
   // Pre-scan when path changes (debounced)
   useEffect(() => {
@@ -366,9 +377,21 @@ const TopBar: React.FC = () => {
   return (
     <>
       <header className="topbar">
-        <span className="topbar-logo">🏗</span>
-        <span className="topbar-title">Code Architect</span>
-        {projectLabel && (
+        {appView === 'workspace' ? (
+          <button
+            className="topbar-btn topbar-home-btn"
+            onClick={() => setSelectedProject(null)}
+            title="Return to Home"
+          >
+            ← 首頁
+          </button>
+        ) : (
+          <>
+            <span className="topbar-logo">🏗</span>
+            <span className="topbar-title">Code Architect</span>
+          </>
+        )}
+        {projectLabel && appView === 'workspace' && (
           <span className="topbar-project" title={projectLabel}>
             {projectLabel.split('/').slice(-2).join('/')}
           </span>
@@ -387,9 +410,11 @@ const TopBar: React.FC = () => {
               >✕</button>
             </span>
           )}
-          <button className="topbar-btn analyze" onClick={() => { setModalError(''); setShowModal(true); }} disabled={isRunning}>
-            Analyze
-          </button>
+          {appView === 'workspace' && (
+            <button className="topbar-btn analyze" onClick={() => { setModalError(''); setShowModal(true); }} disabled={isRunning}>
+              Analyze
+            </button>
+          )}
           <button className="topbar-btn" onClick={() => setDarkMode(!darkMode)} title="Toggle dark mode">
             {darkMode ? '☀️' : '🌙'}
           </button>

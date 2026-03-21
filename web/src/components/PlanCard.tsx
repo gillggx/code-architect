@@ -15,7 +15,7 @@ const riskBadge: Record<string, string> = {
 };
 
 export const PlanCard: React.FC<PlanCardProps> = ({ event }) => {
-  const { currentPlan, setCurrentPlan, agentSession } = useAppStore();
+  const { setCurrentPlan, agentSession } = useAppStore();
   const [showPlanB, setShowPlanB] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [resolved, setResolved] = useState(false);
