@@ -39,22 +39,36 @@ def _check_blocked(resolved: Path) -> None:
             raise PermissionError(f"Writing to '{resolved.name}' is blocked (name pattern {pattern})")
 
 
-def read_file(path: str, project_path: str) -> str:
-    """Read a file within *project_path*.
+def read_file(path: str, project_path: str, offset: int = 0, limit: int = 0) -> str:
+    """Read a file within *project_path*, optionally scoped to a line range.
 
     Args:
         path: File path relative to project root.
         project_path: Absolute path of the project root (sandbox boundary).
+        offset: 1-based line number to start reading from (0 = beginning).
+        limit: Maximum number of lines to return (0 = all).
 
     Returns:
-        File contents as a string.
+        File contents (possibly a slice) with a header showing line range.
 
     Raises:
         PermissionError: If *path* escapes the sandbox.
         FileNotFoundError: If the file does not exist.
     """
     resolved = _resolve(path, project_path)
-    return resolved.read_text(encoding="utf-8", errors="replace")
+    content = resolved.read_text(encoding="utf-8", errors="replace")
+
+    if offset <= 0 and limit <= 0:
+        return content
+
+    all_lines = content.splitlines(keepends=True)
+    total = len(all_lines)
+    start = max(0, offset - 1) if offset > 0 else 0
+    end = min(total, start + limit) if limit > 0 else total
+    sliced = all_lines[start:end]
+
+    header = f"[Lines {start + 1}–{start + len(sliced)} of {total}]\n"
+    return header + "".join(sliced)
 
 
 def write_file(path: str, content: str, project_path: str) -> str:

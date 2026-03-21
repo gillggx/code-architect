@@ -9,10 +9,12 @@ Version: 1.0
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -442,6 +444,19 @@ class LLMAnalyzer:
                 seen.add(p)
                 unique_patterns.append(p)
 
+        # Post-process: build imported_by reverse index across all modules
+        modules = self._build_imported_by(modules)
+
+        # Persist final modules.json with imported_by populated
+        if memory_dir:
+            try:
+                import json as _jfinal
+                modules_path_final = os.path.join(memory_dir, "modules.json")
+                with open(modules_path_final, "w") as _mf:
+                    _jfinal.dump(modules, _mf, ensure_ascii=False, indent=2)
+            except Exception as _exc:
+                logger.warning("Failed to save final modules.json: %s", _exc)
+
         # --- 4. Memory / persistence event ---
         await self._emit(AgentEvent(
             type="memory",
@@ -610,7 +625,7 @@ class LLMAnalyzer:
             file=file_path,
         ))
 
-        memory: dict = {"purpose": "", "key_components": [], "dependencies": [], "patterns": [], "notes": []}
+        memory: dict = {"purpose": "", "key_components": [], "dependencies": [], "patterns": [], "edit_hints": ""}
         raw_response = ""
 
         for chunk_index, chunk in enumerate(chunks, start=1):
@@ -645,7 +660,9 @@ class LLMAnalyzer:
                 parsed = self._parse_llm_response(raw_response)
                 if parsed.get("purpose"):
                     memory["purpose"] = parsed["purpose"]
-                for key in ("key_components", "dependencies", "patterns", "notes"):
+                if parsed.get("edit_hints") and not memory["edit_hints"]:
+                    memory["edit_hints"] = parsed["edit_hints"]
+                for key in ("key_components", "dependencies", "patterns"):
                     existing = memory.get(key, [])
                     new_items = parsed.get(key, [])
                     if isinstance(new_items, list):
@@ -699,6 +716,9 @@ class LLMAnalyzer:
                 data={"pattern": pattern},
             ))
 
+        # --- Extract symbols via AST/regex (accurate, no LLM cost) ---
+        symbols = self._extract_symbols(file_path, content)
+
         # --- Store in memory ---
         module_entry: dict = {
             "name": filename,
@@ -708,7 +728,9 @@ class LLMAnalyzer:
             "key_components": summary_data.get("key_components", []),
             "dependencies": summary_data.get("dependencies", []),
             "patterns": patterns,
-            "notes": summary_data.get("notes", ""),
+            "edit_hints": summary_data.get("edit_hints", "") or summary_data.get("notes", ""),
+            "symbols": symbols,
+            "imported_by": [],   # populated in post-processing pass
             "language": self._detect_language(file_path),
         }
         self._memory[file_path] = module_entry
@@ -720,16 +742,18 @@ class LLMAnalyzer:
     # ------------------------------------------------------------------
 
     def _build_file_prompt(self, file_path: str, content: str) -> str:
-        """Build the analysis prompt for a single file (small files only)."""
+        """Build the edit-oriented analysis prompt for a single file."""
         language = self._detect_language(file_path)
         return (
-            f"Analyze this {language} file. "
-            "Return a JSON with keys: "
-            "purpose (1 sentence), "
-            "key_components (list of class/function names), "
-            "dependencies (list of imports), "
-            "patterns (list of design patterns spotted), "
-            "notes (any important observations). "
+            f"You are preparing a code-editing reference for a {language} file. "
+            "Return JSON with these keys:\n"
+            "- purpose: 1 sentence describing what this file does\n"
+            "- key_components: list of class/function names exported or defined\n"
+            "- dependencies: list of imports/requires\n"
+            "- patterns: list of design patterns spotted\n"
+            "- edit_hints: 1 sentence — the most important gotcha when modifying this file "
+            "(e.g. coupling risks, constants that must stay in sync, side effects on callers, "
+            "or 'none' if straightforward)\n"
             f"File: {file_path}\n\n{content}"
         )
 
@@ -762,9 +786,137 @@ class LLMAnalyzer:
             f"This is chunk {chunk_index}/{total_chunks}.\n"
             f"{memory_str}\n"
             f"Chunk content:\n{chunk}\n\n"
-            f"Return JSON with keys: purpose, key_components, dependencies, patterns, notes. "
+            "Return JSON with keys: purpose, key_components, dependencies, patterns, "
+            "edit_hints (1 sentence: most important gotcha when modifying this file). "
             f"{instruction}"
         )
+
+    # ------------------------------------------------------------------
+    # Symbol extraction (AST for Python, regex for JS/TS)
+    # ------------------------------------------------------------------
+
+    def _extract_symbols(self, file_path: str, content: str) -> List[dict]:
+        """Extract function/class symbols with line numbers for edit navigation."""
+        suffix = Path(file_path).suffix.lower()
+        if suffix == ".py":
+            return self._extract_symbols_python(content)
+        elif suffix in (".ts", ".tsx", ".js", ".jsx", ".mjs"):
+            return self._extract_symbols_js(content)
+        return []
+
+    @staticmethod
+    def _extract_symbols_python(content: str) -> List[dict]:
+        """Use Python AST to get accurate symbols with line ranges."""
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return []
+
+        symbols: List[dict] = []
+
+        def _sig(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+            a = node.args
+            parts: List[str] = []
+            for arg in a.args:
+                parts.append(arg.arg)
+            if a.vararg:
+                parts.append(f"*{a.vararg.arg}")
+            for arg in a.kwonlyargs:
+                parts.append(arg.arg)
+            if a.kwarg:
+                parts.append(f"**{a.kwarg.arg}")
+            prefix = "async def " if isinstance(node, ast.AsyncFunctionDef) else "def "
+            return f"{prefix}{node.name}({', '.join(parts)})"
+
+        for node in tree.body:
+            end = getattr(node, "end_lineno", node.lineno)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                symbols.append({
+                    "name": node.name,
+                    "type": "function",
+                    "line_start": node.lineno,
+                    "line_end": end,
+                    "signature": _sig(node),
+                })
+            elif isinstance(node, ast.ClassDef):
+                symbols.append({
+                    "name": node.name,
+                    "type": "class",
+                    "line_start": node.lineno,
+                    "line_end": end,
+                    "signature": f"class {node.name}",
+                })
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        item_end = getattr(item, "end_lineno", item.lineno)
+                        symbols.append({
+                            "name": f"{node.name}.{item.name}",
+                            "type": "method",
+                            "line_start": item.lineno,
+                            "line_end": item_end,
+                            "signature": _sig(item),
+                        })
+        return symbols
+
+    @staticmethod
+    def _extract_symbols_js(content: str) -> List[dict]:
+        """Regex-based symbol extraction for JS/TS/TSX/JSX (line_start only)."""
+        symbols: List[dict] = []
+        patterns = [
+            (r"(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+(\w+)\s*\(", "function"),
+            (r"(?:export\s+)?(?:abstract\s+)?class\s+(\w+)", "class"),
+            (r"(?:export\s+)?interface\s+(\w+)", "interface"),
+            (r"(?:export\s+)?(?:const|let)\s+(\w+)\s*[=:][^=]", "const"),
+        ]
+        for line_num, line in enumerate(content.splitlines(), 1):
+            stripped = line.strip()
+            for pattern, sym_type in patterns:
+                m = re.match(pattern, stripped)
+                if m:
+                    symbols.append({
+                        "name": m.group(1),
+                        "type": sym_type,
+                        "line_start": line_num,
+                        "line_end": line_num,
+                        "signature": stripped[:100],
+                    })
+                    break
+        return symbols
+
+    # ------------------------------------------------------------------
+    # Imported-by reverse index (post-analysis pass)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_imported_by(modules: List[dict]) -> List[dict]:
+        """
+        Add `imported_by` to each module: list of files that import it.
+
+        Uses stem-matching heuristic: if module B's path stem appears in
+        any of module A's dependency strings, A imports B.
+        """
+        # stem → list of module paths (multiple files can share a stem)
+        stem_map: Dict[str, List[str]] = {}
+        for m in modules:
+            stem = Path(m.get("path", "")).stem
+            if stem:
+                stem_map.setdefault(stem, []).append(m["path"])
+
+        path_to_mod = {m["path"]: m for m in modules}
+        for m in modules:
+            m.setdefault("imported_by", [])
+
+        for m in modules:
+            source = m.get("path", "")
+            for dep in m.get("dependencies", []):
+                dep_stem = Path(dep).stem  # last segment without ext
+                for target_path in stem_map.get(dep_stem, []):
+                    if target_path != source and target_path in path_to_mod:
+                        iby = path_to_mod[target_path]["imported_by"]
+                        if source not in iby:
+                            iby.append(source)
+
+        return modules
 
     # ------------------------------------------------------------------
     # Language detection

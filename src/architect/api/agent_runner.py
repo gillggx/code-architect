@@ -187,14 +187,26 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from the project",
+            "description": (
+                "Read a file from the project. Use offset+limit to read only the relevant "
+                "section of a large file — especially when you know the symbol line number "
+                "from the project memory."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "File path relative to project root",
-                    }
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "1-based line number to start reading from (omit to read from beginning)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of lines to read (omit to read to end of file)",
+                    },
                 },
                 "required": ["path"],
             },
@@ -544,6 +556,21 @@ class AgentRunner:
         except Exception as exc:
             logger.warning("Backup failed for %s: %s", path, exc)
 
+    @staticmethod
+    def _score_relevance(task: str, modules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Sort modules by keyword relevance to the task (descending)."""
+        task_words = set(task.lower().split())
+        def _score(mod: Dict[str, Any]) -> int:
+            text = " ".join([
+                mod.get("name", ""),
+                mod.get("path", ""),
+                mod.get("purpose", ""),
+                " ".join(mod.get("key_components", [])),
+                " ".join(mod.get("patterns", [])),
+            ]).lower()
+            return sum(1 for w in task_words if len(w) > 3 and w in text)
+        return sorted(modules, key=_score, reverse=True)
+
     def _build_system_prompt(self) -> str:
         lines = [
             "You are Code Architect Agent — an expert software engineer.",
@@ -556,15 +583,44 @@ class AgentRunner:
         ]
 
         if self.project_modules:
-            lines.append("## Project modules (from analysis)")
-            for mod in self.project_modules[:40]:
-                name = mod.get("name") or mod.get("file", "unknown")
-                purpose = mod.get("purpose") or mod.get("summary", "")
-                patterns_list = mod.get("patterns", [])
-                line = f"- **{name}**: {purpose}"
-                if patterns_list:
-                    line += f" [patterns: {', '.join(patterns_list[:3])}]"
-                lines.append(line)
+            ranked = self._score_relevance(self.task, self.project_modules)
+            top = ranked[:6]
+            rest = ranked[6:]
+
+            lines.append("## Most relevant files for this task")
+            for mod in top:
+                name = mod.get("name", "unknown")
+                path = mod.get("path", "")
+                purpose = mod.get("purpose", "")
+                edit_hints = mod.get("edit_hints") or mod.get("notes", "")
+                symbols = mod.get("symbols", [])
+                imported_by = mod.get("imported_by", [])
+
+                lines.append(f"\n### {name}  `{path}`")
+                lines.append(f"**Purpose:** {purpose}")
+                if edit_hints and edit_hints.lower() not in ("none", "none.", ""):
+                    lines.append(f"**Edit hints:** {edit_hints}")
+                if symbols:
+                    sym_lines = []
+                    for s in symbols[:12]:
+                        sym_lines.append(
+                            f"  - `{s['name']}` line {s['line_start']}–{s['line_end']}: {s['signature']}"
+                        )
+                    lines.append("**Symbols (use for read_file offset):**")
+                    lines.extend(sym_lines)
+                if imported_by:
+                    lines.append(f"**Imported by:** {', '.join(imported_by[:5])}")
+
+            if rest:
+                lines.append("\n## Other project modules")
+                for mod in rest[:34]:
+                    name = mod.get("name") or mod.get("file", "unknown")
+                    purpose = mod.get("purpose", "")
+                    patterns_list = mod.get("patterns", [])
+                    entry = f"- **{name}**: {purpose}"
+                    if patterns_list:
+                        entry += f" [{', '.join(patterns_list[:2])}]"
+                    lines.append(entry)
             lines.append("")
 
         if self.context:
@@ -966,7 +1022,7 @@ Now generate the real plan for the task above. You may include plan_b if there i
                     call_messages = messages
 
                 # Force tool use on first iteration so agent doesn't just output analysis text
-                tc_mode = "required" if iteration == 0 else "auto"
+                tc_mode = "required" if iteration == 1 else "auto"
 
                 try:
                     response = await client.chat.completions.create(
@@ -1267,7 +1323,9 @@ Now generate the real plan for the task above. You may include plan_b if there i
 
             if fn_name == "read_file":
                 path = fn_args["path"]
-                content = read_file(path, pp)
+                offset = int(fn_args.get("offset") or 0)
+                limit = int(fn_args.get("limit") or 0)
+                content = read_file(path, pp, offset=offset, limit=limit)
                 # Record as read (for read-before-write enforcement)
                 normalized = Path(path).as_posix()
                 self._files_read.add(normalized)
@@ -1275,9 +1333,9 @@ Now generate the real plan for the task above. You may include plan_b if there i
                 snippet = content[:400].replace('\n', ' ').strip()
                 if snippet:
                     self._working_memory[normalized] = snippet
-                # Truncate for messages to avoid token blow-up
-                if len(content) > 8000:
-                    content = content[:8000] + "\n... (truncated)"
+                # Truncate for messages to avoid token blow-up (only if no slice requested)
+                if offset <= 0 and limit <= 0 and len(content) > 8000:
+                    content = content[:8000] + "\n... (truncated — use offset+limit to read more)"
                 return content, None
 
             elif fn_name == "list_files":
