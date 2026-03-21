@@ -4,7 +4,7 @@
  */
 
 import React, { useEffect, useState } from 'react';
-import { useAppStore, ProjectRecord } from '../store/app';
+import { useAppStore, ProjectRecord, MemoryModule, FileNode } from '../store/app';
 
 interface Props {
   onClose: () => void;
@@ -15,10 +15,18 @@ const ProjectManagerPanel: React.FC<Props> = ({ onClose }) => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [openingId, setOpeningId] = useState<string | null>(null);
+  const [openWithEdit, setOpenWithEdit] = useState(false);
 
   const setProjectsList = useAppStore(s => s.setProjectsList);
   const setSelectedProject = useAppStore(s => s.setSelectedProject);
   const setPendingAnalyzePath = useAppStore(s => s.setPendingAnalyzePath);
+  const setFileTree = useAppStore(s => s.setFileTree);
+  const addModule = useAppStore(s => s.addModule);
+  const clearModules = useAppStore(s => s.clearModules);
+  const setPatterns = useAppStore(s => s.setPatterns);
+  const setEditMode = useAppStore(s => s.setEditMode);
+  const clearEvents = useAppStore(s => s.clearEvents);
 
   const fetchProjects = async () => {
     setLoading(true);
@@ -59,10 +67,60 @@ const ProjectManagerPanel: React.FC<Props> = ({ onClose }) => {
   };
 
   const handleReanalyze = (project: ProjectRecord) => {
-    // Switch to workspace and trigger analysis via pendingAnalyzePath
     setSelectedProject({ path: project.project_path, id: project.project_id });
     setPendingAnalyzePath(project.project_path);
     onClose();
+  };
+
+  const handleOpen = async (project: ProjectRecord) => {
+    setOpeningId(project.project_id);
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(project.project_id)}/load`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json() as {
+        project_id: string;
+        project_path: string;
+        modules: Array<{
+          name: string;
+          path: string;
+          full_path?: string;
+          purpose?: string;
+          patterns?: string[];
+          key_components?: string[];
+        }>;
+        file_tree: FileNode[];
+      };
+
+      // Reset workspace state
+      clearModules();
+      clearEvents();
+
+      // Populate store
+      setSelectedProject({ path: data.project_path, id: data.project_id });
+      setFileTree(data.file_tree as FileNode[]);
+
+      const allPatterns: string[] = [];
+      for (const m of data.modules) {
+        const mod: MemoryModule = {
+          name: m.name,
+          path: m.full_path || m.path,
+          purpose: m.purpose || '',
+          patterns: m.patterns || [],
+          key_components: m.key_components || [],
+        };
+        addModule(mod);
+        allPatterns.push(...(m.patterns || []));
+      }
+      setPatterns([...new Set(allPatterns)]);
+
+      if (openWithEdit) setEditMode(true);
+
+      onClose();
+    } catch (err) {
+      alert(`開啟失敗: ${(err as Error).message}`);
+    } finally {
+      setOpeningId(null);
+    }
   };
 
   const formatDate = (iso: string | null): string => {
@@ -107,6 +165,19 @@ const ProjectManagerPanel: React.FC<Props> = ({ onClose }) => {
             </div>
           )}
 
+          {!loading && !error && (
+            <div className="project-manager-open-option">
+              <label className="project-open-edit-toggle">
+                <input
+                  type="checkbox"
+                  checked={openWithEdit}
+                  onChange={e => setOpenWithEdit(e.target.checked)}
+                />
+                <span>開啟時進入 Edit 模式</span>
+              </label>
+            </div>
+          )}
+
           {!loading && !error && projects.map(project => (
             <div key={project.project_id} className="project-card">
               <div className="project-card-info">
@@ -122,6 +193,13 @@ const ProjectManagerPanel: React.FC<Props> = ({ onClose }) => {
                 </div>
               </div>
               <div className="project-card-actions">
+                <button
+                  className="project-card-btn open"
+                  onClick={() => handleOpen(project)}
+                  disabled={openingId === project.project_id}
+                >
+                  {openingId === project.project_id ? '載入中…' : '🗂 開啟'}
+                </button>
                 <button
                   className="project-card-btn reanalyze"
                   onClick={() => handleReanalyze(project)}

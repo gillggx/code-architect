@@ -30,17 +30,30 @@ const STATUS_COLOR: Record<FileNode['status'], string> = {
 interface FileRowProps {
   node: FileNode;
   modified: boolean;
+  editMode: boolean;
+  projectId: string;
+  onOpenFile: (path: string) => void;
 }
 
-const FileRow: React.FC<FileRowProps> = ({ node, modified }) => {
+const FileRow: React.FC<FileRowProps> = ({ node, modified, editMode, onOpenFile }) => {
   const [expanded, setExpanded] = useState(false);
+
+  const handleClick = () => {
+    if (editMode && !node.isDir) {
+      onOpenFile(node.path);
+    } else if (node.summary) {
+      setExpanded((v) => !v);
+    }
+  };
+
+  const isClickable = (editMode && !node.isDir) || !!node.summary;
 
   return (
     <div className="file-row-wrapper">
       <div
-        className={`file-row${node.summary ? ' clickable' : ''}`}
-        onClick={() => node.summary && setExpanded((v) => !v)}
-        title={node.path}
+        className={`file-row${isClickable ? ' clickable' : ''}${editMode && !node.isDir ? ' editable' : ''}`}
+        onClick={handleClick}
+        title={editMode && !node.isDir ? `Open ${node.path}` : node.path}
       >
         <span
           className="file-status-icon"
@@ -58,11 +71,14 @@ const FileRow: React.FC<FileRowProps> = ({ node, modified }) => {
             ●
           </span>
         )}
-        {node.summary && (
+        {!editMode && node.summary && (
           <span className="file-expand-toggle">{expanded ? '▲' : '▼'}</span>
         )}
+        {editMode && !node.isDir && (
+          <span className="file-open-hint" style={{ color: '#888', fontSize: '0.65rem', marginLeft: 4 }}>✎</span>
+        )}
       </div>
-      {expanded && node.summary && (
+      {!editMode && expanded && node.summary && (
         <div className="file-summary">{node.summary}</div>
       )}
     </div>
@@ -76,6 +92,16 @@ const FileTree: React.FC = () => {
   const { fileTree } = useFileTree();
   const { filesTotal, filesAnalyzed } = useJob();
   const modifiedFiles = useAppStore(s => s.modifiedFiles);
+  const editMode = useAppStore(s => s.editMode);
+  const selectedProject = useAppStore(s => s.selectedProject);
+  const setOpenedFile = useAppStore(s => s.setOpenedFile);
+  const setCenterTab = useAppStore(s => s.setCenterTab);
+
+  const handleOpenFile = (path: string) => {
+    if (!selectedProject) return;
+    setOpenedFile({ path, projectId: selectedProject.id });
+    setCenterTab('file');
+  };
 
   const total = fileTree.length;
   const pct = filesTotal > 0 ? Math.round((filesAnalyzed / filesTotal) * 100) : 0;
@@ -115,7 +141,14 @@ const FileTree: React.FC = () => {
                 modifiedFiles.has(node.name) ||
                 [...modifiedFiles].some(f => node.path.endsWith(f) || f.endsWith(node.name));
               return (
-                <FileRow key={node.path} node={node} modified={isModified} />
+                <FileRow
+                  key={node.path}
+                  node={node}
+                  modified={isModified}
+                  editMode={editMode}
+                  projectId={selectedProject?.id ?? ''}
+                  onOpenFile={handleOpenFile}
+                />
               );
             })}
           </div>

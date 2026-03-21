@@ -13,6 +13,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import AsyncIterator, Optional
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = os.getenv("DEFAULT_LLM_MODEL", "anthropic/claude-opus-4-5")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+CUSTOM_LLM_BASE_URL = os.getenv("CUSTOM_LLM_BASE_URL", "")
+CUSTOM_LLM_API_KEY = os.getenv("CUSTOM_LLM_API_KEY", "none")
 
 
 class LLMClient:
@@ -48,11 +51,14 @@ class LLMClient:
 
         self._api_key = os.getenv("OPENROUTER_API_KEY", "")
         self._use_openrouter = bool(self._api_key)
+        self._use_custom = bool(CUSTOM_LLM_BASE_URL) and not self._use_openrouter
 
         if self._use_openrouter:
             logger.info("LLMClient: using OpenRouter (%s)", model)
+        elif self._use_custom:
+            logger.info("LLMClient: using custom LLM endpoint %s (%s)", CUSTOM_LLM_BASE_URL, model)
         else:
-            logger.info("LLMClient: no OPENROUTER_API_KEY — falling back to Ollama")
+            logger.info("LLMClient: no OPENROUTER_API_KEY or CUSTOM_LLM_BASE_URL — falling back to Ollama")
 
     # ------------------------------------------------------------------
     # Public API
@@ -79,6 +85,9 @@ class LLMClient:
         if self._use_openrouter:
             async for chunk in self._stream_openrouter(messages, chosen_model):
                 yield chunk
+        elif self._use_custom:
+            async for chunk in self._stream_custom(messages, chosen_model):
+                yield chunk
         else:
             async for chunk in self._stream_ollama(messages, chosen_model):
                 yield chunk
@@ -90,12 +99,28 @@ class LLMClient:
     ) -> str:
         """
         Non-streaming completion — collects all chunks and returns full string.
-        Useful for A2A calls where you need the full response at once.
+        Retries up to 3 times with exponential backoff on HTTP 429 rate-limit errors.
         """
-        chunks: list[str] = []
-        async for chunk in self.stream(messages, model=model):
-            chunks.append(chunk)
-        return "".join(chunks)
+        max_retries = 3
+        for attempt in range(max_retries):
+            chunks: list[str] = []
+            async for chunk in self.stream(messages, model=model):
+                chunks.append(chunk)
+            result = "".join(chunks)
+
+            # Detect rate-limit error from any backend and retry with backoff
+            if "[LLM Error:" in result and ("429" in result or "rate_limit" in result.lower()):
+                if attempt < max_retries - 1:
+                    wait_secs = 2 ** attempt  # 1s, 2s (attempt 0 and 1)
+                    logger.warning(
+                        "Rate limit hit, retrying in %ds (attempt %d/%d)",
+                        wait_secs, attempt + 1, max_retries,
+                    )
+                    await asyncio.sleep(wait_secs)
+                    continue
+
+            return result
+        return result
 
     # ------------------------------------------------------------------
     # OpenRouter (OpenAI-compatible)
@@ -134,6 +159,44 @@ class LLMClient:
                     yield delta
         except Exception as exc:
             logger.error("OpenRouter error: %s", exc)
+            yield f"[LLM Error: {exc}]"
+
+    # ------------------------------------------------------------------
+    # Custom LLM (corporate / on-prem OpenAI-compatible endpoint)
+    # ------------------------------------------------------------------
+
+    async def _stream_custom(
+        self, messages: list[dict], model: str
+    ) -> AsyncIterator[str]:
+        """Stream from a custom OpenAI-compatible endpoint.
+        Model name is used as-is — no mapping applied.
+        """
+        try:
+            from openai import AsyncOpenAI
+        except ImportError:
+            logger.error("openai package not installed")
+            yield "[Error: openai package missing]"
+            return
+
+        client = AsyncOpenAI(
+            api_key=CUSTOM_LLM_API_KEY,
+            base_url=CUSTOM_LLM_BASE_URL,
+        )
+
+        try:
+            stream = await client.chat.completions.create(
+                model=model,
+                messages=messages,  # type: ignore[arg-type]
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                stream=True,
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+        except Exception as exc:
+            logger.error("Custom LLM error: %s", exc)
             yield f"[LLM Error: {exc}]"
 
     # ------------------------------------------------------------------

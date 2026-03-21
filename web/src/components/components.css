@@ -440,6 +440,92 @@
   white-space: pre-wrap;
 }
 
+.chat-bubble-markdown {
+  white-space: normal;
+  line-height: 1.6;
+}
+
+.chat-bubble-markdown p {
+  margin: 0.3em 0;
+}
+
+.chat-bubble-markdown p:first-child { margin-top: 0; }
+.chat-bubble-markdown p:last-child  { margin-bottom: 0; }
+
+.chat-bubble-markdown h1,
+.chat-bubble-markdown h2,
+.chat-bubble-markdown h3 {
+  margin: 0.6em 0 0.2em;
+  font-size: 1em;
+  font-weight: 700;
+}
+
+.chat-bubble-markdown ul,
+.chat-bubble-markdown ol {
+  margin: 0.3em 0;
+  padding-left: 1.4em;
+}
+
+.chat-bubble-markdown li { margin: 0.15em 0; }
+
+.chat-bubble-markdown code {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 0.82em;
+  background: rgba(0,0,0,0.08);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+
+.chat-bubble-user .chat-bubble-markdown code {
+  background: rgba(255,255,255,0.2);
+}
+
+.chat-bubble-markdown pre {
+  background: rgba(0,0,0,0.06);
+  border-radius: 6px;
+  padding: 0.6em 0.8em;
+  overflow-x: auto;
+  margin: 0.4em 0;
+}
+
+.chat-bubble-markdown pre code {
+  background: none;
+  padding: 0;
+  font-size: 0.8em;
+}
+
+.chat-bubble-markdown table {
+  border-collapse: collapse;
+  font-size: 0.85em;
+  margin: 0.5em 0;
+  width: 100%;
+}
+
+.chat-bubble-markdown th,
+.chat-bubble-markdown td {
+  border: 1px solid rgba(0,0,0,0.15);
+  padding: 4px 10px;
+  text-align: left;
+}
+
+.chat-bubble-markdown th {
+  background: rgba(0,0,0,0.06);
+  font-weight: 600;
+}
+
+.chat-bubble-markdown hr {
+  border: none;
+  border-top: 1px solid rgba(0,0,0,0.12);
+  margin: 0.6em 0;
+}
+
+.dark-mode .chat-bubble-markdown code        { background: rgba(255,255,255,0.1); }
+.dark-mode .chat-bubble-markdown pre         { background: rgba(255,255,255,0.05); }
+.dark-mode .chat-bubble-markdown th          { background: rgba(255,255,255,0.05); }
+.dark-mode .chat-bubble-markdown th,
+.dark-mode .chat-bubble-markdown td          { border-color: rgba(255,255,255,0.12); }
+.dark-mode .chat-bubble-markdown hr          { border-top-color: rgba(255,255,255,0.1); }
+
 .chat-cursor {
   display: inline-block;
   animation: blink 0.7s step-end infinite;
@@ -661,6 +747,7 @@
   padding: 12px 16px;
   margin: 8px 0;
   background: #1a1a2e;
+  color: #e8e8f0;
 }
 .plan-card--confirm {
   border-color: #f39c12;
@@ -741,6 +828,7 @@
   padding: 12px 16px;
   margin: 8px 0;
   background: #2c0a0a;
+  color: #f0e0e0;
 }
 .escalation-card--resolved {
   border-color: #27ae60;
@@ -1376,4 +1464,517 @@
   background: #2a0d0d;
   border-color: #e74c3c;
   color: #e74c3c;
+}
+
+/* ── FileTree edit mode ──────────────────────────────────── */
+
+.file-row.editable:hover {
+  background: rgba(41, 128, 185, 0.08);
+  cursor: pointer;
+}
+
+.dark-mode .file-row.editable:hover {
+  background: rgba(41, 128, 185, 0.15);
+}
+
+/* ── FileEditor ──────────────────────────────────────────── */
+
+.file-editor {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.file-editor-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 0.5rem;
+  color: #aaa;
+}
+
+.file-editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.75rem;
+  border-bottom: 1px solid #e0e0e0;
+  background: #f8f8f8;
+  flex-shrink: 0;
+  font-size: 0.8rem;
+  overflow: hidden;
+}
+
+.dark-mode .file-editor-toolbar {
+  background: #1e1e1e;
+  border-color: #333;
+}
+
+.file-editor-filename {
+  font-weight: 600;
+  color: #2c3e50;
+  white-space: nowrap;
+}
+
+.dark-mode .file-editor-filename {
+  color: #ccc;
+}
+
+.file-editor-path {
+  color: #aaa;
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.file-editor-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.file-editor-status {
+  font-size: 0.72rem;
+  padding: 0.15rem 0.4rem;
+  border-radius: 3px;
+}
+
+.file-editor-status.loading {
+  color: #e67e22;
+  background: rgba(230, 126, 34, 0.1);
+}
+
+.file-editor-status.error {
+  color: #c0392b;
+  background: rgba(192, 57, 43, 0.1);
+}
+
+.file-editor-status.saved {
+  color: #27ae60;
+  background: rgba(39, 174, 96, 0.1);
+}
+
+.file-editor-dirty {
+  font-size: 0.72rem;
+  color: #e67e22;
+}
+
+.file-editor-save-btn {
+  padding: 0.2rem 0.7rem;
+  font-size: 0.78rem;
+  border: 1px solid #27ae60;
+  border-radius: 4px;
+  background: transparent;
+  color: #27ae60;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.file-editor-save-btn:hover:not(:disabled) {
+  background: rgba(39, 174, 96, 0.1);
+}
+
+.file-editor-save-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.dark-mode .file-editor-save-btn {
+  color: #2ecc71;
+  border-color: #2ecc71;
+}
+
+.file-editor-body {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+.file-editor-body .cm-editor {
+  height: 100%;
+}
+
+.file-editor-body .cm-scroller {
+  height: 100%;
+}
+
+/* ── ProjectManager open button & toggle ─────────────────── */
+
+.project-manager-open-option {
+  padding: 0.5rem 1rem 0.25rem;
+}
+
+.project-open-edit-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: #555;
+  cursor: pointer;
+  user-select: none;
+}
+
+.dark-mode .project-open-edit-toggle {
+  color: #aaa;
+}
+
+.project-open-edit-toggle input[type="checkbox"] {
+  accent-color: #2980b9;
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+}
+
+.project-card-btn.open {
+  background: #eaf3fb;
+  border-color: #1a6fa8;
+  color: #1a6fa8;
+}
+
+.project-card-btn.open:hover:not(:disabled) {
+  background: #d0e8f7;
+}
+
+.dark-mode .project-card-btn.open {
+  background: #0d2233;
+  border-color: #5aabdb;
+  color: #5aabdb;
+}
+
+/* ── MemoryPanel error module card ───────────────────────── */
+
+.memory-module-card-error {
+  border-color: rgba(192, 57, 43, 0.25);
+  background: rgba(192, 57, 43, 0.04);
+  opacity: 0.75;
+}
+
+.dark-mode .memory-module-card-error {
+  border-color: rgba(231, 76, 60, 0.3);
+  background: rgba(192, 57, 43, 0.08);
+}
+
+/* ── FileEditor: main layout with explain panel ──────────── */
+
+.file-editor-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.file-editor-body {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  min-height: 0;
+}
+
+/* ── Explain button ──────────────────────────────────────── */
+
+.file-editor-explain-btn {
+  padding: 0.2rem 0.7rem;
+  font-size: 0.78rem;
+  border: 1px solid #8e44ad;
+  border-radius: 4px;
+  background: transparent;
+  color: #8e44ad;
+  cursor: pointer;
+  transition: background 0.15s;
+  white-space: nowrap;
+}
+
+.file-editor-explain-btn:hover:not(:disabled) {
+  background: rgba(142, 68, 173, 0.1);
+}
+
+.file-editor-explain-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.dark-mode .file-editor-explain-btn {
+  color: #bb8fce;
+  border-color: #bb8fce;
+}
+
+/* ── Explain panel ───────────────────────────────────────── */
+
+.explain-panel {
+  flex-shrink: 0;
+  max-height: 40%;
+  min-height: 120px;
+  display: flex;
+  flex-direction: column;
+  border-top: 2px solid #8e44ad;
+  background: #fdf9ff;
+  overflow: hidden;
+}
+
+.dark-mode .explain-panel {
+  background: #1a1025;
+  border-color: #7d3c98;
+}
+
+.explain-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.3rem 0.75rem;
+  background: rgba(142, 68, 173, 0.08);
+  flex-shrink: 0;
+}
+
+.dark-mode .explain-panel-header {
+  background: rgba(142, 68, 173, 0.15);
+}
+
+.explain-panel-title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #8e44ad;
+}
+
+.dark-mode .explain-panel-title {
+  color: #bb8fce;
+}
+
+.explain-streaming-indicator {
+  font-size: 0.7rem;
+  color: #e67e22;
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.explain-panel-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #888;
+  font-size: 0.85rem;
+  padding: 0.1rem 0.3rem;
+  border-radius: 3px;
+}
+
+.explain-panel-close:hover {
+  background: rgba(0,0,0,0.08);
+  color: #333;
+}
+
+.dark-mode .explain-panel-close:hover {
+  background: rgba(255,255,255,0.1);
+  color: #ccc;
+}
+
+.explain-panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.75rem 1rem;
+}
+
+.explain-panel-text {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.85rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #2c3e50;
+  margin: 0;
+}
+
+.dark-mode .explain-panel-text {
+  color: #d5d8dc;
+}
+
+/* ── FileMemoryDetail ────────────────────────────────────── */
+
+.file-memory-detail {
+  padding: 1rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.file-memory-filename {
+  font-size: 1rem;
+  font-weight: 700;
+  color: #2c3e50;
+  word-break: break-word;
+}
+
+.dark-mode .file-memory-filename {
+  color: #ecf0f1;
+}
+
+.file-memory-path {
+  font-size: 0.7rem;
+  color: #aaa;
+  word-break: break-all;
+  margin-top: -0.25rem;
+}
+
+.file-memory-section-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  margin-top: 0.35rem;
+}
+
+.dark-mode .file-memory-section-label {
+  color: #666;
+}
+
+.file-memory-purpose {
+  font-size: 0.82rem;
+  line-height: 1.55;
+  color: #34495e;
+  background: rgba(41, 128, 185, 0.06);
+  border-left: 3px solid #2980b9;
+  padding: 0.4rem 0.6rem;
+  border-radius: 0 4px 4px 0;
+}
+
+.dark-mode .file-memory-purpose {
+  color: #bdc3c7;
+  background: rgba(41, 128, 185, 0.1);
+}
+
+.file-memory-purpose-error {
+  color: #c0392b;
+  background: rgba(192, 57, 43, 0.06);
+  border-color: #c0392b;
+}
+
+.file-memory-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.file-memory-components {
+  margin: 0;
+  padding-left: 1.2rem;
+  font-size: 0.8rem;
+  color: #555;
+  line-height: 1.7;
+}
+
+.dark-mode .file-memory-components {
+  color: #aaa;
+}
+
+.file-memory-no-record {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1rem;
+  gap: 0.5rem;
+}
+
+/* ── DependencyGraph ────────────────────────────────────── */
+
+.dependency-graph {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  position: relative;
+}
+
+.graph-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.75rem;
+  background: var(--panel-header-bg, #f0f0f0);
+  border-bottom: 1px solid var(--border-color, #ddd);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.graph-toolbar-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.78rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.graph-toolbar-select {
+  font-size: 0.75rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border-color, #ccc);
+  background: var(--input-bg, #fff);
+  color: var(--text-color, #333);
+  cursor: pointer;
+}
+
+.graph-toolbar-btn {
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border-color, #ccc);
+  background: var(--panel-header-bg, #f0f0f0);
+  color: var(--text-color, #333);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.graph-toolbar-btn:hover { background: var(--hover-bg, #e0e0e0); }
+.graph-toolbar-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.graph-toolbar-hint {
+  font-size: 0.7rem;
+  color: var(--text-muted, #888);
+  margin-left: auto;
+}
+
+.graph-canvas {
+  flex: 1;
+  min-height: 0;
+}
+
+.graph-loading,
+.graph-error,
+.graph-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--text-muted, #888);
+}
+
+.graph-error { color: #c0392b; }
+
+.graph-tooltip {
+  position: absolute;
+  z-index: 999;
+  background: rgba(0, 0, 0, 0.8);
+  color: #fff;
+  font-size: 0.72rem;
+  padding: 4px 8px;
+  border-radius: 4px;
+  max-width: 280px;
+  pointer-events: none;
+  white-space: pre-wrap;
+  line-height: 1.4;
 }

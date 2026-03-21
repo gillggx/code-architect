@@ -3,8 +3,8 @@
 set -e
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BACKEND_PORT=8001
-FRONTEND_PORT=3001
+BACKEND_PORT=8765
+FRONTEND_PORT=3011
 
 echo "==> Killing old processes on ports $BACKEND_PORT and $FRONTEND_PORT..."
 lsof -ti :$BACKEND_PORT | xargs kill -9 2>/dev/null && echo "    Killed backend (port $BACKEND_PORT)" || echo "    No process on port $BACKEND_PORT"
@@ -30,7 +30,7 @@ npm install
 echo ""
 echo "==> Starting backend (port $BACKEND_PORT)..."
 cd "$PROJECT_DIR"
-uvicorn src.architect.api.main:app --reload --port $BACKEND_PORT &
+uvicorn src.architect.api.main:app --reload --host 127.0.0.1 --port $BACKEND_PORT &
 BACKEND_PID=$!
 echo "    Backend PID: $BACKEND_PID"
 
@@ -53,9 +53,9 @@ echo "    Frontend PID: $FRONTEND_PID"
 
 echo ""
 echo "========================================"
-echo "  Backend:  http://localhost:$BACKEND_PORT"
-echo "  API Docs: http://localhost:$BACKEND_PORT/docs"
-echo "  Frontend: http://localhost:$FRONTEND_PORT"
+echo "  Backend:  http://127.0.0.1:$BACKEND_PORT"
+echo "  API Docs: http://127.0.0.1:$BACKEND_PORT/docs"
+echo "  Frontend: http://127.0.0.1:$FRONTEND_PORT  ← open this"
 echo "========================================"
 echo "  Press Ctrl+C to stop all services"
 echo "========================================"

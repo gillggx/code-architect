@@ -178,6 +178,9 @@ SKIP_FILES: frozenset[str] = frozenset({
 MAX_FILES = None  # No limit — analyze all files
 MAX_CONTENT_CHARS = 8_000
 
+# Concurrent LLM calls during analysis (tune via env var)
+ANALYSIS_CONCURRENCY = int(os.getenv("ANALYSIS_CONCURRENCY", "6"))
+
 
 # ---------------------------------------------------------------------------
 # Data-classes
@@ -293,15 +296,41 @@ class LLMAnalyzer:
                     except Exception:
                         pass
                 snap_count = len(old_snapshot.file_snapshots)
+                force_reanalyze = False
+
                 if snap_count > 0 and modules_count < snap_count:
                     # More than half the snapshotted files have no module entry
                     logger.warning(
                         "Memory mismatch: %d snapshots but only %d modules — clearing snapshot for full re-analysis",
                         snap_count, modules_count,
                     )
+                    force_reanalyze = True
+
+                # Also force re-analysis if modules contain LLM errors
+                # (previous analysis ran with a bad/missing model)
+                if not force_reanalyze and os.path.exists(modules_path):
+                    try:
+                        import json as _json3
+                        mods = _json3.load(open(modules_path))
+                        if isinstance(mods, list):
+                            error_count = sum(
+                                1 for m in mods
+                                if isinstance(m.get("purpose"), str)
+                                and m["purpose"].startswith("[LLM Error")
+                            )
+                            if error_count > 0:
+                                logger.warning(
+                                    "Found %d modules with LLM errors — clearing snapshot for full re-analysis",
+                                    error_count,
+                                )
+                                force_reanalyze = True
+                    except Exception:
+                        pass
+
+                if force_reanalyze:
                     await self._emit(AgentEvent(
                         type="scan",
-                        message=f"Memory inconsistent ({snap_count} snapshots, {modules_count} modules) — re-analyzing all files.",
+                        message="Previous analysis had errors — re-analyzing all files.",
                     ))
                     old_snapshot = None  # force full re-analysis
 
@@ -354,45 +383,56 @@ class LLMAnalyzer:
                 data={"skipped": files_skipped_priority},
             ))
 
-        # --- 3. Analyse each file ---
-        modules: List[dict] = []
-        all_patterns_seen: List[str] = []
-
-        # Build snapshot dict in memory; flush to disk after each file (no repeated loads)
+        # --- 3. Analyse each file (parallel, bounded by ANALYSIS_CONCURRENCY) ---
         from ..memory.incremental_analysis import FileSnapshot as _FileSnapshot
         from ..memory.incremental_analysis import ProjectSnapshot as _ProjectSnapshot
         import json as _json_inc
         import time as _time
+
+        modules: List[dict] = []
+        all_patterns_seen: List[str] = []
         running_snaps = dict(old_snapshot.file_snapshots) if old_snapshot else {}
 
-        for idx, file_path in enumerate(priority_files, 1):
-            logger.info("Analyzing file %d/%d: %s", idx, len(priority_files), file_path)
-            result = await self._analyze_file(file_path, project_path)
-            if result is not None:
-                modules.append(result)
-                all_patterns_seen.extend(result.get("patterns", []))
-                # Save incremental snapshot + modules after each file so progress
-                # survives interruptions. Both must stay in sync.
-                if memory_dir:
-                    try:
-                        stat = os.stat(file_path)
-                        running_snaps[file_path] = _FileSnapshot(
-                            path=file_path,
-                            mtime=stat.st_mtime,
-                            size=stat.st_size,
-                        )
-                        partial_snap = _ProjectSnapshot(
-                            project_path=project_path,
-                            analyzed_at=_time.time(),
-                            file_snapshots=running_snaps,
-                        )
-                        await detector.save_snapshot(partial_snap, memory_dir)
+        semaphore = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
+        write_lock = asyncio.Lock()  # protects modules list + disk writes
+        total = len(priority_files)
 
-                        modules_path_inc = os.path.join(memory_dir, "modules.json")
-                        with open(modules_path_inc, "w") as _mf:
-                            _json_inc.dump(modules, _mf, ensure_ascii=False, indent=2)
-                    except Exception as _exc:
-                        logger.warning("Failed to save incremental snapshot/modules: %s", _exc)
+        async def _analyze_one(idx: int, file_path: str) -> None:
+            async with semaphore:
+                logger.info("Analyzing file %d/%d: %s", idx, total, file_path)
+                result = await self._analyze_file(file_path, project_path)
+                if result is None:
+                    return
+
+                async with write_lock:
+                    modules.append(result)
+                    all_patterns_seen.extend(result.get("patterns", []))
+                    # Persist snapshot + modules so progress survives interruptions
+                    if memory_dir:
+                        try:
+                            stat = os.stat(file_path)
+                            running_snaps[file_path] = _FileSnapshot(
+                                path=file_path,
+                                mtime=stat.st_mtime,
+                                size=stat.st_size,
+                            )
+                            partial_snap = _ProjectSnapshot(
+                                project_path=project_path,
+                                analyzed_at=_time.time(),
+                                file_snapshots=running_snaps,
+                            )
+                            await detector.save_snapshot(partial_snap, memory_dir)
+
+                            modules_path_inc = os.path.join(memory_dir, "modules.json")
+                            with open(modules_path_inc, "w") as _mf:
+                                _json_inc.dump(modules, _mf, ensure_ascii=False, indent=2)
+                        except Exception as _exc:
+                            logger.warning("Failed to save incremental snapshot/modules: %s", _exc)
+
+        await asyncio.gather(
+            *[_analyze_one(idx, fp) for idx, fp in enumerate(priority_files, 1)],
+            return_exceptions=True,
+        )
 
         # Deduplicate patterns while preserving order
         seen: set[str] = set()
@@ -800,6 +840,185 @@ class LLMAnalyzer:
         except Exception as exc:
             logger.warning("on_event callback raised: %s", exc)
 
+    # ------------------------------------------------------------------
+    # Refresh (incremental update — only new/changed/error files)
+    # ------------------------------------------------------------------
+
+    async def refresh_project(
+        self,
+        project_path: str,
+        memory_dir: str,
+    ) -> AnalysisSummary:
+        """
+        Incremental refresh: only analyze files that are new, changed, or had
+        LLM errors in the previous run. Merges results back into modules.json
+        and removes paths that no longer exist on disk.
+
+        Args:
+            project_path: Absolute path to the project root.
+            memory_dir:   Directory where modules.json + SNAPSHOTS.json live.
+
+        Returns:
+            AnalysisSummary covering only the refreshed files.
+        """
+        import json as _j
+        from ..memory.incremental_analysis import FileSnapshot as _FileSnapshot
+        from ..memory.incremental_analysis import ProjectSnapshot as _ProjectSnapshot
+        import time as _time
+
+        start_time = time.monotonic()
+        project_path = str(Path(project_path).resolve())
+        logger.info("=== refresh_project START: %s ===", project_path)
+
+        # --- Load existing modules.json ---
+        modules_path = os.path.join(memory_dir, "modules.json")
+        existing_modules: dict[str, dict] = {}  # path → module
+        if os.path.isfile(modules_path):
+            try:
+                raw = _j.loads(open(modules_path).read())
+                if isinstance(raw, list):
+                    for m in raw:
+                        if isinstance(m, dict) and m.get("full_path"):
+                            existing_modules[m["full_path"]] = m
+                        elif isinstance(m, dict) and m.get("path"):
+                            existing_modules[m["path"]] = m
+            except Exception:
+                pass
+
+        # --- Load existing snapshot ---
+        detector = ChangeDetector()
+        old_snapshot = await detector.load_snapshot(memory_dir)
+
+        # --- Scan all source files ---
+        await self._emit(AgentEvent(type="scan", message=f"⚡ Refreshing {project_path}..."))
+        all_files = self._scan_directory(project_path)
+
+        # Build current stat dict
+        current_stats: dict[str, dict] = {}
+        for fp in all_files:
+            try:
+                stat = os.stat(fp)
+                current_stats[fp] = {"mtime": stat.st_mtime, "size": stat.st_size}
+            except OSError:
+                pass
+
+        # --- Determine which files need analysis ---
+        to_analyze: list[str] = []
+        for fp in all_files:
+            cur = current_stats.get(fp)
+            if cur is None:
+                continue
+
+            # New file — not in snapshot at all
+            if old_snapshot is None or fp not in old_snapshot.file_snapshots:
+                to_analyze.append(fp)
+                continue
+
+            snap = old_snapshot.file_snapshots[fp]
+            # Changed mtime/size
+            if cur["mtime"] != snap.mtime or cur["size"] != snap.size:
+                to_analyze.append(fp)
+                continue
+
+            # Previous run had LLM error
+            mod = existing_modules.get(fp) or existing_modules.get(
+                str(Path(fp).relative_to(project_path))
+            )
+            if mod and isinstance(mod.get("purpose"), str) and mod["purpose"].startswith("[LLM Error"):
+                to_analyze.append(fp)
+
+        # Emit skip events for unchanged files
+        already_done = set(all_files) - set(to_analyze)
+        if already_done:
+            await self._emit(AgentEvent(
+                type="scan",
+                message=f"⚡ Skipping {len(already_done)} unchanged files, re-analyzing {len(to_analyze)}.",
+                data={"skipped_analyzed": len(already_done)},
+            ))
+
+        if not to_analyze:
+            await self._emit(AgentEvent(type="done", message="⚡ Nothing to refresh — all files up to date.", data={"files_analyzed": 0, "patterns_found": 0, "duration_seconds": 0.0}))
+            # Still remove deleted files from modules.json
+            existing_keys = set(existing_modules.keys())
+            on_disk = set(all_files)
+            for deleted in existing_keys - on_disk:
+                existing_modules.pop(deleted, None)
+            merged = list(existing_modules.values())
+            with open(modules_path, "w") as _mf:
+                _j.dump(merged, _mf, ensure_ascii=False, indent=2)
+            return AnalysisSummary(project_path=project_path, files_scanned=len(all_files), files_analyzed=0, files_skipped=len(already_done), modules=merged, all_patterns=[], duration_seconds=0.0)
+
+        # --- Analyze in parallel (same concurrency as analyze_project) ---
+        priority_files = self._prioritize_files(to_analyze)
+        running_snaps = dict(old_snapshot.file_snapshots) if old_snapshot else {}
+        new_modules: list[dict] = []
+        semaphore = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
+        write_lock = asyncio.Lock()
+        total = len(priority_files)
+
+        async def _refresh_one(idx: int, file_path: str) -> None:
+            async with semaphore:
+                logger.info("Refreshing file %d/%d: %s", idx, total, file_path)
+                result = await self._analyze_file(file_path, project_path)
+                if result is None:
+                    return
+                async with write_lock:
+                    new_modules.append(result)
+                    existing_modules[file_path] = result
+                    # Update snapshot for this file
+                    try:
+                        stat = os.stat(file_path)
+                        running_snaps[file_path] = _FileSnapshot(
+                            path=file_path, mtime=stat.st_mtime, size=stat.st_size,
+                        )
+                        partial_snap = _ProjectSnapshot(
+                            project_path=project_path,
+                            analyzed_at=_time.time(),
+                            file_snapshots=running_snaps,
+                        )
+                        await detector.save_snapshot(partial_snap, memory_dir)
+                        merged = list(existing_modules.values())
+                        with open(modules_path, "w") as _mf:
+                            _j.dump(merged, _mf, ensure_ascii=False, indent=2)
+                    except Exception as exc:
+                        logger.warning("Failed to save refresh snapshot: %s", exc)
+
+        await asyncio.gather(
+            *[_refresh_one(idx, fp) for idx, fp in enumerate(priority_files, 1)],
+            return_exceptions=True,
+        )
+
+        # --- Remove deleted files from modules.json ---
+        on_disk = set(all_files)
+        for deleted in list(existing_modules.keys()):
+            if deleted not in on_disk:
+                existing_modules.pop(deleted)
+
+        merged_modules = list(existing_modules.values())
+        with open(modules_path, "w") as _mf:
+            _j.dump(merged_modules, _mf, ensure_ascii=False, indent=2)
+
+        all_patterns_seen = [p for m in new_modules for p in m.get("patterns", [])]
+        seen: set[str] = set()
+        unique_patterns = [p for p in all_patterns_seen if not (p in seen or seen.add(p))]  # type: ignore[func-returns-value]
+
+        duration = time.monotonic() - start_time
+        await self._emit(AgentEvent(
+            type="done",
+            message=f"⚡ Refresh complete: {len(new_modules)} files re-analyzed in {duration:.1f}s.",
+            data={"files_analyzed": len(new_modules), "patterns_found": len(unique_patterns), "duration_seconds": round(duration, 2)},
+        ))
+
+        return AnalysisSummary(
+            project_path=project_path,
+            files_scanned=len(all_files),
+            files_analyzed=len(new_modules),
+            files_skipped=len(already_done),
+            modules=merged_modules,
+            all_patterns=unique_patterns,
+            duration_seconds=round(duration, 2),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -819,9 +1038,13 @@ def create_llm_analyzer(
     Returns:
         Configured LLMAnalyzer instance.
     """
+    import os
     from ..llm.client import create_llm_client
 
-    return LLMAnalyzer(llm_client=create_llm_client(), on_event=on_event)
+    # Use ANALYSIS_LLM_MODEL if set (cheaper model for bulk file analysis),
+    # otherwise fall back to DEFAULT_LLM_MODEL.
+    analysis_model = os.getenv("ANALYSIS_LLM_MODEL") or os.getenv("DEFAULT_LLM_MODEL")
+    return LLMAnalyzer(llm_client=create_llm_client(model=analysis_model) if analysis_model else create_llm_client(), on_event=on_event)
 
 
 __all__ = [

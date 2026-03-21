@@ -6,9 +6,13 @@
  */
 
 import React, { useEffect, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { useAgentEvents, useChat, useAppStore, AgentEvent, ChatMessage } from '../store/app';
 import { PlanCard } from './PlanCard';
 import { EscalationCard } from './EscalationCard';
+import FileEditor from './FileEditor';
+import DependencyGraph from './DependencyGraph';
 
 // ---------------------------------------------------------------------------
 // Event metadata
@@ -295,8 +299,11 @@ const EventRow: React.FC<{ event: AgentEvent }> = ({ event }) => {
 export const MessageBubble: React.FC<{ msg: ChatMessage }> = ({ msg }) => (
   <div className={`chat-bubble chat-bubble-${msg.role}`}>
     <div className="chat-bubble-role">{msg.role === 'user' ? 'You' : 'Assistant'}</div>
-    <div className="chat-bubble-content">
-      {msg.content}
+    <div className="chat-bubble-content chat-bubble-markdown">
+      {msg.role === 'assistant'
+        ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+        : msg.content
+      }
       {msg.streaming && <span className="chat-cursor">▍</span>}
     </div>
   </div>
@@ -310,6 +317,9 @@ const AgentActivityFeed: React.FC = () => {
   const { chatMessages, clearChat } = useChat();
   const centerTab = useAppStore(s => s.centerTab);
   const setCenterTab = useAppStore(s => s.setCenterTab);
+  const openedFile = useAppStore(s => s.openedFile);
+  const setOpenedFile = useAppStore(s => s.setOpenedFile);
+  const editMode = useAppStore(s => s.editMode);
 
   const activityBottomRef = useRef<HTMLDivElement>(null);
   const chatBottomRef = useRef<HTMLDivElement>(null);
@@ -359,6 +369,30 @@ const AgentActivityFeed: React.FC = () => {
             💬 Chat
             {chatMessages.length > 0 && <span className="tab-badge">{chatMessages.length}</span>}
           </button>
+          {editMode && openedFile && (
+            <span className={`panel-tab panel-tab-closeable${centerTab === 'file' ? ' active' : ''}`}>
+              <span
+                className="panel-tab-label"
+                onClick={() => setCenterTab('file')}
+              >
+                ✎ {openedFile.path.split('/').pop()}
+              </span>
+              <button
+                className="panel-tab-close"
+                title="關閉檔案"
+                onClick={() => {
+                  setOpenedFile(null);
+                  setCenterTab('activity');
+                }}
+              >✕</button>
+            </span>
+          )}
+          <button
+            className={`panel-tab${centerTab === 'graph' ? ' active' : ''}`}
+            onClick={() => setCenterTab('graph')}
+          >
+            🕸 Graph
+          </button>
         </div>
         <div className="panel-header-actions">
           {centerTab === 'activity' && events.length > 0 && (
@@ -403,6 +437,12 @@ const AgentActivityFeed: React.FC = () => {
           </div>
         )
       )}
+
+      {/* File editor tab */}
+      {centerTab === 'file' && <FileEditor />}
+
+      {/* Dependency graph tab */}
+      {centerTab === 'graph' && <DependencyGraph />}
     </div>
   );
 };

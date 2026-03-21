@@ -109,9 +109,15 @@ class ChatEngine:
         messages = self._build_messages(session, user_message, context, analysis_status=analysis_status, recent_changes=recent_changes)
 
         # 3. Route to model
-        decision = self.router.route(user_message)
-        model = decision.primary_model
-        logger.info("Chat → model=%s complexity=%s", model, decision.reason)
+        # Skip router when using custom/Ollama endpoints — they don't support
+        # OpenRouter model IDs like "anthropic/claude-sonnet-4-5".
+        if self.llm._use_custom or not self.llm._use_openrouter:
+            model = self.llm.model
+            logger.info("Chat → model=%s (custom/local endpoint, routing skipped)", model)
+        else:
+            decision = self.router.route(user_message)
+            model = decision.primary_model
+            logger.info("Chat → model=%s complexity=%s", model, decision.reason)
 
         # 4. Add user message to history before streaming
         session.add("user", user_message)

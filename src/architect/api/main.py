@@ -46,6 +46,7 @@ from .schemas import (
     ApproveRequest,
     ApprovePlanRequest,
     EscalationRequest,
+    RevertRequest,
 )
 from ..llm import create_chat_engine, get_or_create_session
 from .websocket import (
@@ -348,7 +349,127 @@ def create_app(debug: bool = False) -> FastAPI:
         asyncio.create_task(run_analysis())
 
         return {"job_id": job_id, "project_id": project_id, "status": "queued"}
-    
+
+    @app.post(
+        "/api/analyze/refresh",
+        tags=["analysis"],
+        summary="Incremental refresh — only re-analyze new/changed/error files",
+    )
+    async def refresh_analysis(request: AnalysisRequest, req: Request) -> dict:
+        """
+        Like /api/analyze but skips files that haven't changed since the last run.
+        Requires an existing modules.json + SNAPSHOTS.json in architect_memory.
+        Falls back to full analysis if no prior snapshot exists.
+        """
+        auth_middleware = get_auth_middleware()
+        await auth_middleware(req)
+
+        if not os.path.exists(request.project_path):
+            raise ValidationError(
+                f"Project path does not exist: {request.project_path}",
+                field="project_path",
+            )
+
+        import hashlib
+        job_id = str(uuid4())
+        if request.project_id:
+            project_id = request.project_id
+        else:
+            path_hash = hashlib.sha1(
+                os.path.abspath(request.project_path).encode()
+            ).hexdigest()[:12]
+            folder_name = os.path.basename(request.project_path.rstrip("/")) or "project"
+            project_id = f"{folder_name}-{path_hash}"
+
+        async with _app_state._lock:
+            _app_state.active_jobs[job_id] = {
+                "status": "queued",
+                "project_id": project_id,
+                "project_path": request.project_path,
+                "summary": None,
+            }
+
+        manager = get_connection_manager()
+        await manager.init_job_buffer(job_id)
+
+        async def run_refresh():
+            manager = get_connection_manager()
+
+            async def on_event(event: AgentEvent):
+                payload = {
+                    "type": event.type,
+                    "message": event.message,
+                    "file": event.file,
+                    "summary": event.summary,
+                    "data": event.data,
+                }
+                ws_msg = WebSocketMessage(type="agent_event", job_id=job_id, data=payload)
+                await manager.broadcast_to_job(job_id, ws_msg)
+
+            try:
+                async with _app_state._lock:
+                    _app_state.active_jobs[job_id]["status"] = "running"
+
+                memory_dir = os.path.join("architect_memory", project_id)
+                os.makedirs(memory_dir, exist_ok=True)
+                with open(os.path.join(memory_dir, "project_path.txt"), "w") as _pf:
+                    _pf.write(os.path.abspath(request.project_path))
+
+                analyzer = create_llm_analyzer(on_event=on_event)
+
+                # If no snapshot exists fall back to full analysis
+                snap_path = os.path.join(memory_dir, "SNAPSHOTS.json")
+                if not os.path.isfile(snap_path):
+                    summary = await analyzer.analyze_project(
+                        request.project_path, memory_dir=memory_dir,
+                    )
+                else:
+                    summary = await analyzer.refresh_project(
+                        request.project_path, memory_dir=memory_dir,
+                    )
+
+                async with _app_state._lock:
+                    _app_state.active_jobs[job_id]["status"] = "complete"
+                    _app_state.active_jobs[job_id]["summary"] = summary
+
+                if summary.modules:
+                    import json as _json
+                    modules_path = os.path.join(memory_dir, "modules.json")
+                    os.makedirs(memory_dir, exist_ok=True)
+                    with open(modules_path, "w") as _f:
+                        _json.dump(summary.modules, _f, ensure_ascii=False, indent=2)
+                    _app_state.chat_engine.update_project_context(project_id, summary.modules)
+
+                await manager.broadcast_to_job(job_id, WebSocketMessage(
+                    type="agent_event",
+                    job_id=job_id,
+                    data={
+                        "type": "done",
+                        "message": f"⚡ Refresh complete — {summary.files_analyzed} files re-analyzed",
+                        "data": {
+                            "files_scanned": summary.files_scanned,
+                            "files_analyzed": summary.files_analyzed,
+                            "files_skipped": summary.files_skipped,
+                            "patterns": summary.all_patterns,
+                            "modules": summary.modules,
+                            "duration_seconds": summary.duration_seconds,
+                        },
+                    },
+                ))
+
+            except Exception as exc:
+                logger.error("Refresh job %s failed: %s", job_id, exc)
+                await manager.broadcast_to_job(job_id, WebSocketMessage(
+                    type="agent_event",
+                    job_id=job_id,
+                    data={"type": "error", "message": str(exc)},
+                ))
+                async with _app_state._lock:
+                    _app_state.active_jobs[job_id]["status"] = "error"
+
+        asyncio.create_task(run_refresh())
+        return {"job_id": job_id, "project_id": project_id, "status": "queued", "mode": "refresh"}
+
     @app.get(
         "/api/jobs/{job_id}",
         response_model=AnalysisProgress,
@@ -515,6 +636,307 @@ def create_app(debug: bool = False) -> FastAPI:
         results.sort(key=lambda x: x["last_analyzed"] or "", reverse=True)
 
         return {"projects": results, "total_count": len(results)}
+
+    @app.get(
+        "/api/projects/{project_id}/load",
+        tags=["projects"],
+        summary="Load a project's memory modules and file tree",
+    )
+    async def load_project(project_id: str) -> dict:
+        """
+        Returns stored memory modules and a reconstructed file tree for a
+        previously analyzed project, so the UI can restore workspace state
+        without re-running analysis.
+        """
+        import json as _j
+
+        memory_dir = os.path.join("architect_memory", project_id)
+        if not os.path.isdir(memory_dir):
+            raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
+
+        # Read project path
+        project_path = ""
+        path_file = os.path.join(memory_dir, "project_path.txt")
+        if os.path.isfile(path_file):
+            project_path = open(path_file).read().strip()
+
+        # Read modules
+        modules: list = []
+        modules_file = os.path.join(memory_dir, "modules.json")
+        if os.path.isfile(modules_file):
+            try:
+                raw = _j.loads(open(modules_file).read())
+                modules = raw if isinstance(raw, list) else list(raw.values())
+            except Exception:
+                pass
+
+        # Build file tree from modules (status = done for all known files)
+        file_nodes = []
+        for m in modules:
+            file_nodes.append({
+                "path": m.get("full_path") or os.path.join(project_path, m.get("path", "")),
+                "name": m.get("name") or m.get("path", ""),
+                "status": "done",
+                "summary": m.get("purpose") or "",
+                "isDir": False,
+            })
+
+        return {
+            "project_id": project_id,
+            "project_path": project_path,
+            "modules": modules,
+            "file_tree": file_nodes,
+        }
+
+    @app.get(
+        "/api/projects/{project_id}/graph",
+        tags=["projects"],
+        summary="Dependency graph for Cytoscape visualization",
+    )
+    async def project_graph(project_id: str) -> dict:
+        """
+        Builds a node/edge graph from modules.json dependency lists.
+        - Nodes: one per MemoryModule (internal) + external packages
+        - Edges: internal if dependency resolves to a known module path;
+                 external otherwise
+        No LLM calls — pure data transformation.
+        """
+        import json as _j
+
+        memory_dir = os.path.join("architect_memory", project_id)
+        if not os.path.isdir(memory_dir):
+            raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
+
+        modules_file = os.path.join(memory_dir, "modules.json")
+        if not os.path.isfile(modules_file):
+            return {"nodes": [], "edges": []}
+
+        try:
+            raw = _j.loads(open(modules_file).read())
+            modules: list = raw if isinstance(raw, list) else []
+        except Exception:
+            return {"nodes": [], "edges": []}
+
+        # Read project path for entry-point detection
+        path_file = os.path.join(memory_dir, "project_path.txt")
+        project_path = open(path_file).read().strip() if os.path.isfile(path_file) else ""
+
+        # Build lookups for dependency resolution
+        # path_lookup: full/rel path → module
+        # stem_lookup: filename-without-extension → module  (e.g. "scenarios" → scenarios.py)
+        path_lookup: dict[str, dict] = {}
+        stem_lookup: dict[str, dict] = {}
+        for m in modules:
+            if m.get("full_path"):
+                path_lookup[m["full_path"]] = m
+            if m.get("path"):
+                path_lookup[m["path"]] = m
+                path_lookup[os.path.basename(m["path"])] = m
+            # Index by stem — "scenarios.py" → key "scenarios"
+            name = m.get("name") or os.path.basename(m.get("path", "") or m.get("full_path", ""))
+            stem = name.rsplit(".", 1)[0] if "." in name else name
+            if stem:
+                stem_lookup[stem] = m
+
+        ENTRY_NAMES = {"main.py", "app.py", "server.py", "index.ts", "index.js",
+                       "app.ts", "app.js", "server.ts", "server.js", "main.ts",
+                       "main.js", "index.tsx", "index.jsx"}
+
+        nodes = []
+        edges = []
+        external_nodes: set[str] = set()
+
+        for m in modules:
+            node_id = m.get("full_path") or m.get("path", "")
+            name = m.get("name") or os.path.basename(node_id)
+            nodes.append({
+                "id": node_id,
+                "name": name,
+                "purpose": m.get("purpose", ""),
+                "patterns": m.get("patterns", []),
+                "is_entry": name in ENTRY_NAMES,
+                "type": "internal",
+            })
+
+        for m in modules:
+            source_id = m.get("full_path") or m.get("path", "")
+            for dep in m.get("dependencies", []):
+                if not dep or not isinstance(dep, str):
+                    continue
+                dep = dep.strip()
+
+                # Resolve dep to an internal module.
+                # deps may be: "scenarios", "scenarios.ValidationResult",
+                # "from scenarios import X", bare package name, etc.
+                resolved = None
+
+                # Extract the root module name from various formats
+                # e.g. "scenarios.ValidationResult" → "scenarios"
+                #      "from scenarios import X"    → "scenarios"
+                dep_clean = dep
+                if dep_clean.startswith("from "):
+                    dep_clean = dep_clean.split()[1]  # "from X import ..." → "X"
+                if dep_clean.startswith("import "):
+                    dep_clean = dep_clean.split()[1]
+
+                # Segments to try: first segment and last segment
+                first_seg = dep_clean.split(".")[0].split("/")[0]
+                last_seg  = dep_clean.split(".")[-1].split("/")[-1]
+
+                stem_candidates = [dep_clean, first_seg, last_seg]
+                path_candidates = [
+                    dep_clean,
+                    dep_clean.replace(".", "/") + ".py",
+                    dep_clean.replace(".", "/") + ".ts",
+                    dep_clean.replace(".", "/") + ".tsx",
+                    first_seg + ".py",
+                    first_seg + ".ts",
+                    first_seg + ".tsx",
+                    first_seg + ".js",
+                    os.path.basename(dep_clean),
+                ]
+
+                # Stem lookup first (most reliable for Python/TS imports)
+                for sc in stem_candidates:
+                    if sc and sc in stem_lookup:
+                        target = stem_lookup[sc]
+                        resolved = target.get("full_path") or target.get("path", "")
+                        break
+
+                # Fall back to path lookup
+                if not resolved:
+                    for c in path_candidates:
+                        if c and c in path_lookup:
+                            target = path_lookup[c]
+                            resolved = target.get("full_path") or target.get("path", "")
+                            break
+
+                if resolved and resolved != source_id:
+                    edges.append({"source": source_id, "target": resolved, "type": "internal"})
+                else:
+                    # External dependency — add node once
+                    ext_id = dep.split(".")[0].split("/")[0]  # top-level package name
+                    if ext_id and ext_id not in external_nodes:
+                        external_nodes.add(ext_id)
+                        nodes.append({
+                            "id": ext_id,
+                            "name": ext_id,
+                            "purpose": "",
+                            "patterns": [],
+                            "is_entry": False,
+                            "type": "external",
+                        })
+                    if ext_id and ext_id != source_id:
+                        edges.append({"source": source_id, "target": ext_id, "type": "external"})
+
+        # Deduplicate edges
+        seen_edges: set[tuple] = set()
+        unique_edges = []
+        for e in edges:
+            key = (e["source"], e["target"])
+            if key not in seen_edges:
+                seen_edges.add(key)
+                unique_edges.append(e)
+
+        return {"nodes": nodes, "edges": unique_edges}
+
+    @app.get(
+        "/api/projects/{project_id}/freshness",
+        tags=["projects"],
+        summary="Check if tracked files have changed since last analysis",
+    )
+    async def project_freshness(project_id: str) -> dict:
+        """
+        Pure filesystem stat check — no LLM calls. Runs in < 100ms.
+
+        Returns:
+          last_analyzed_at  — ISO timestamp of last analysis (from SNAPSHOTS.json mtime)
+          total_tracked     — number of files in the snapshot
+          changed_files     — files whose mtime or size differs from snapshot
+          new_files         — source files on disk not in the snapshot
+          deleted_files     — files in snapshot that no longer exist on disk
+          is_fresh          — True when no changes detected
+        """
+        import json as _j
+        from datetime import timezone
+
+        memory_dir = os.path.join("architect_memory", project_id)
+        if not os.path.isdir(memory_dir):
+            raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
+
+        snap_path = os.path.join(memory_dir, "SNAPSHOTS.json")
+        if not os.path.isfile(snap_path):
+            return {
+                "last_analyzed_at": None,
+                "total_tracked": 0,
+                "changed_files": [],
+                "new_files": [],
+                "deleted_files": [],
+                "is_fresh": False,
+            }
+
+        # Load snapshot
+        try:
+            snap_data = _j.loads(open(snap_path).read())
+        except Exception:
+            raise HTTPException(status_code=500, detail="Could not read snapshot")
+
+        snap_mtime = os.path.getmtime(snap_path)
+        last_analyzed_at = datetime.fromtimestamp(snap_mtime, tz=timezone.utc).isoformat()
+        file_snapshots: dict = snap_data.get("file_snapshots", {})
+
+        # Compare each tracked file against its snapshot
+        changed_files = []
+        deleted_files = []
+        for fpath, snap in file_snapshots.items():
+            if not os.path.exists(fpath):
+                deleted_files.append({"path": fpath, "reason": "deleted"})
+                continue
+            try:
+                stat = os.stat(fpath)
+                if stat.st_mtime != snap.get("mtime") or stat.st_size != snap.get("size"):
+                    changed_files.append({"path": fpath, "reason": "mtime_changed"})
+            except OSError:
+                deleted_files.append({"path": fpath, "reason": "unreadable"})
+
+        # Detect new source files not yet in snapshot
+        # Read project path to scan for new files
+        new_files = []
+        path_file = os.path.join(memory_dir, "project_path.txt")
+        if os.path.isfile(path_file):
+            project_path = open(path_file).read().strip()
+            if os.path.isdir(project_path):
+                skip_dirs = frozenset({
+                    "node_modules", ".git", "__pycache__", "venv", ".venv",
+                    "env", "dist", "build", ".tox", ".mypy_cache", ".pytest_cache",
+                    "site-packages",
+                })
+                source_exts = frozenset({
+                    ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs",
+                    ".java", ".cpp", ".c", ".h", ".hpp", ".cs",
+                    ".toml", ".yaml", ".yml",
+                })
+                for dirpath, dirnames, filenames in os.walk(project_path):
+                    dirnames[:] = [
+                        d for d in dirnames
+                        if d not in skip_dirs and not d.startswith(".")
+                    ]
+                    for fname in filenames:
+                        fp = os.path.join(dirpath, fname)
+                        ext = os.path.splitext(fname)[1].lower()
+                        if ext in source_exts and fp not in file_snapshots:
+                            new_files.append({"path": fp, "reason": "not_in_memory"})
+
+        is_fresh = not changed_files and not new_files and not deleted_files
+
+        return {
+            "last_analyzed_at": last_analyzed_at,
+            "total_tracked": len(file_snapshots),
+            "changed_files": changed_files,
+            "new_files": new_files,
+            "deleted_files": deleted_files,
+            "is_fresh": is_fresh,
+        }
 
     @app.delete(
         "/api/projects/{project_id}",
@@ -742,6 +1164,19 @@ def create_app(debug: bool = False) -> FastAPI:
 
         async def event_stream():
             try:
+                # Explain Selection: bypass chat engine, use custom system prompt directly
+                if request.system_override:
+                    messages = [
+                        {"role": "system", "content": request.system_override},
+                        {"role": "user", "content": request.message},
+                    ]
+                    decision = _app_state.chat_engine.router.route(request.message)
+                    async for chunk in _app_state.chat_engine.llm.stream(messages, model=decision.primary_model):
+                        payload = json.dumps({"type": "chunk", "data": chunk})
+                        yield f"data: {payload}\n\n"
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
                 async for chunk in _app_state.chat_engine.stream_chat(
                     session, request.message,
                     analysis_status=analysis_status,
@@ -1143,6 +1578,32 @@ def create_app(debug: bool = False) -> FastAPI:
         sess.approval_event.set()  # unblock any waiting approval
         return {"ok": True, "session_id": session_id}
 
+    @app.post(
+        "/api/agent/revert",
+        tags=["agent"],
+        summary="Revert a file to its most recent backup",
+    )
+    async def revert_file(request: RevertRequest) -> dict:
+        """Restore a file from the .architect/backup/ directory (most recent snapshot)."""
+        import shutil as _shutil
+        from pathlib import Path as _Path
+
+        project_path = os.path.abspath(os.path.expanduser(request.project_path))
+        backup_dir = _Path(project_path) / ".architect" / "backup"
+        if not backup_dir.exists():
+            raise HTTPException(status_code=404, detail="No backup directory found for this project.")
+
+        safe_name = str(_Path(request.file_path).as_posix()).replace("/", "__")
+        candidates = sorted(backup_dir.glob(f"{safe_name}.*"), reverse=True)
+        if not candidates:
+            raise HTTPException(status_code=404, detail=f"No backup found for: {request.file_path}")
+
+        latest_backup = candidates[0]
+        target = _Path(project_path) / request.file_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _shutil.copy2(latest_backup, target)
+        return {"ok": True, "restored_from": str(latest_backup.name), "file": request.file_path}
+
     # ========================================================================
     # File System Helpers (for GUI folder browser + pre-scan)
     # ========================================================================
@@ -1267,6 +1728,104 @@ def create_app(debug: bool = False) -> FastAPI:
         finally:
             await manager.unregister_job(job_id, client_id)
     
+    # ========================================================================
+    # File read / write endpoints
+    # ========================================================================
+
+    @app.get(
+        "/api/file",
+        tags=["files"],
+        summary="Read a project file's content",
+    )
+    async def read_file(path: str, project_id: str) -> dict:
+        """
+        Returns the full text content of a file.
+        `path` must be an absolute path that lives inside the project root.
+        Binary files are rejected with a 415 error.
+        """
+        import mimetypes as _mt
+
+        # Resolve project root from memory dir
+        memory_dir = os.path.join("architect_memory", project_id)
+        project_path: Optional[str] = None
+        path_file = os.path.join(memory_dir, "project_path.txt")
+        if os.path.isfile(path_file):
+            project_path = open(path_file).read().strip()
+
+        # Resolve relative paths against the project root
+        if project_path and not os.path.isabs(path):
+            path = os.path.join(project_path, path)
+
+        # Security: path must be within the project root
+        abs_path = os.path.realpath(path)
+        if project_path:
+            real_root = os.path.realpath(project_path)
+            if not abs_path.startswith(real_root + os.sep) and abs_path != real_root:
+                raise HTTPException(status_code=403, detail="Path is outside project root")
+
+        if not os.path.isfile(abs_path):
+            raise HTTPException(status_code=404, detail=f"File not found: {path}")
+
+        # Reject binary files
+        mime, _ = _mt.guess_type(abs_path)
+        binary_exts = {'.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.woff',
+                       '.woff2', '.ttf', '.eot', '.pdf', '.zip', '.tar', '.gz',
+                       '.pyc', '.pyo', '.so', '.dylib', '.dll', '.exe'}
+        ext = os.path.splitext(abs_path)[1].lower()
+        if ext in binary_exts:
+            raise HTTPException(status_code=415, detail="Binary file — cannot display as text")
+
+        try:
+            content = open(abs_path, encoding='utf-8', errors='replace').read()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        return {"path": path, "content": content}
+
+    @app.post(
+        "/api/file",
+        tags=["files"],
+        summary="Write content back to a project file",
+    )
+    async def write_file(body: dict) -> dict:
+        """
+        Saves edited file content to disk.
+        Body: { "path": "...", "content": "...", "project_id": "..." }
+        """
+        path = body.get("path", "")
+        content = body.get("content", "")
+        project_id = body.get("project_id", "")
+
+        if not path:
+            raise HTTPException(status_code=400, detail="path is required")
+
+        # Resolve project root for security check
+        memory_dir = os.path.join("architect_memory", project_id)
+        project_path: Optional[str] = None
+        path_file = os.path.join(memory_dir, "project_path.txt")
+        if os.path.isfile(path_file):
+            project_path = open(path_file).read().strip()
+
+        if project_path and not os.path.isabs(path):
+            path = os.path.join(project_path, path)
+
+        abs_path = os.path.realpath(path)
+        if project_path:
+            real_root = os.path.realpath(project_path)
+            if not abs_path.startswith(real_root + os.sep) and abs_path != real_root:
+                raise HTTPException(status_code=403, detail="Path is outside project root")
+
+        if not os.path.isfile(abs_path):
+            raise HTTPException(status_code=404, detail=f"File not found: {path}")
+
+        try:
+            with open(abs_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        return {"saved": True, "path": path}
+
     # ========================================================================
     # Error Handlers
     # ========================================================================

@@ -8,7 +8,6 @@ import {
   AgentEvent,
   FileNode,
   MemoryModule,
-  AnalysisJob,
   useChat,
 } from '../store/app';
 
@@ -108,13 +107,15 @@ const TopBar: React.FC = () => {
   const clearModules = useAppStore((s) => s.clearModules);
   const setPatterns = useAppStore((s) => s.setPatterns);
   const setFilesTotal = useAppStore((s) => s.setFilesTotal);
-  const setFilesAnalyzed = useAppStore((s) => s.setFilesAnalyzed);
   const incrementFilesAnalyzed = useAppStore((s) => s.incrementFilesAnalyzed);
   const resetProgress = useAppStore((s) => s.resetProgress);
   const pendingAnalyzePath = useAppStore((s) => s.pendingAnalyzePath);
   const setPendingAnalyzePath = useAppStore((s) => s.setPendingAnalyzePath);
   const { addChatMessage, updateLastAssistantMessage, setChatStreaming } = useChat();
   const chatSessionIdRef = useRef<string>(crypto.randomUUID());
+
+  const freshnessStatus = useAppStore((s) => s.freshnessStatus);
+  const setFreshnessStatus = useAppStore((s) => s.setFreshnessStatus);
 
   const [showModal, setShowModal] = useState(false);
   const [showBrowser, setShowBrowser] = useState(false);
@@ -127,10 +128,174 @@ const TopBar: React.FC = () => {
 
   const fileListRef = useRef<FileNode[]>([]);
   const allPatternsRef = useRef<string[]>([]);
-  useAppStore.subscribe((state) => {
-    fileListRef.current = state.fileTree;
-    allPatternsRef.current = state.allPatterns;
-  });
+  useEffect(() => {
+    return useAppStore.subscribe((state) => {
+      fileListRef.current = state.fileTree;
+      allPatternsRef.current = state.allPatterns;
+    });
+  }, []);
+
+  // Attach WebSocket event handlers whenever a new analysis job starts.
+  // This covers jobs started from both TopBar (Analyze button) and HomeView (card flow).
+  useEffect(() => {
+    if (!currentJob || !currentJob.ws) return;
+    const job = currentJob;
+    const ws = currentJob.ws as WebSocket;
+    const { projectId, projectPath } = job;
+
+    ws.onmessage = (ev) => {
+      let payload: Record<string, unknown>;
+      try { payload = JSON.parse(ev.data as string); } catch { return; }
+      if (payload.type !== 'agent_event') return;
+
+      const raw = (
+        typeof payload.data === 'object' && payload.data !== null
+          ? payload.data : payload
+      ) as Record<string, unknown>;
+
+      const event: AgentEvent = {
+        id: (raw.id as string) ?? crypto.randomUUID(),
+        type: (raw.type as AgentEvent['type']) ?? 'scan',
+        message: (raw.message as string) ?? '',
+        file: raw.file as string | undefined,
+        summary: raw.summary as string | undefined,
+        data: raw.data as Record<string, unknown> | undefined,
+        timestamp: new Date(),
+      };
+
+      addEvent(event);
+
+      if (event.file) {
+        if (event.type === 'scan') addFileIfMissing(event.file);
+        else if (event.type === 'llm_start') {
+          addFileIfMissing(event.file);
+          updateFileStatus(event.file, 'analyzing');
+        } else if (event.type === 'llm_done') {
+          updateFileStatus(event.file, 'done', event.summary);
+          incrementFilesAnalyzed();
+        } else if (event.type === 'skip') {
+          addFileIfMissing(event.file);
+          updateFileStatus(event.file, 'skipped');
+        }
+      }
+
+      if (event.type === 'memory' && event.data) {
+        const d = event.data;
+        const mod: MemoryModule = {
+          name: (d.name as string) ?? event.file ?? 'module',
+          path: (d.path as string) ?? event.file ?? '',
+          purpose: (d.purpose as string) ?? event.summary ?? '',
+          patterns: Array.isArray(d.patterns) ? (d.patterns as string[]) : [],
+          key_components: Array.isArray(d.key_components) ? (d.key_components as string[]) : [],
+        };
+        addModule(mod);
+      }
+
+      if (event.type === 'pattern') {
+        const pattern = (event.data?.pattern as string) ?? (event.data?.name as string) ?? event.message;
+        if (pattern) addPatternIfMissing(pattern);
+      }
+
+      if (event.type === 'done') {
+        setCurrentJob({ ...job, status: 'complete' });
+        ws.close();
+        // Refresh freshness status after analysis completes
+        setTimeout(() => checkFreshness(projectId), 1000);
+        // Reload full file tree + modules from disk so Refresh doesn't show partial tree
+        (async () => {
+          try {
+            const r = await fetch(`/api/projects/${encodeURIComponent(projectId)}/load`);
+            if (!r.ok) return;
+            const d = await r.json() as {
+              modules: Array<Record<string, unknown>>;
+              file_tree: Array<{ path: string; name: string; status: string; isDir: boolean; summary?: string }>;
+            };
+            if (d.file_tree?.length) {
+              fileListRef.current = d.file_tree as FileNode[];
+              setFileTree(d.file_tree as FileNode[]);
+            }
+            if (d.modules?.length) {
+              clearModules();
+              for (const m of d.modules) {
+                addModule({
+                  name: (m.name as string) || '',
+                  path: (m.path as string) || '',
+                  purpose: (m.purpose as string) || '',
+                  patterns: Array.isArray(m.patterns) ? (m.patterns as string[]) : [],
+                  key_components: Array.isArray(m.key_components) ? (m.key_components as string[]) : [],
+                });
+              }
+            }
+          } catch { /* ignore */ }
+        })();
+        const filesAnalyzed = (event.data?.files_analyzed as number) ?? 0;
+        const patternsFound = (event.data?.patterns_found as number) ?? 0;
+        const duration = (event.data?.duration_seconds as number) ?? 0;
+        const projectName = projectPath.split('/').filter(Boolean).pop() ?? projectPath;
+        addChatMessage({
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: `✅ **Analysis complete** — ${projectName}\n${filesAnalyzed} files analyzed · ${patternsFound} patterns detected · ${duration.toFixed(1)}s\n\nAsk me anything about the architecture.`,
+        });
+        const autoPrompt = `Summarize the key architectural findings from this analysis in 3-5 bullet points.`;
+        addChatMessage({ id: crypto.randomUUID(), role: 'user', content: autoPrompt });
+        setChatStreaming(true);
+        addChatMessage({ id: crypto.randomUUID(), role: 'assistant', content: '', streaming: true });
+        (async () => {
+          try {
+            const res = await fetch('/api/chat', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message: autoPrompt, project_id: projectId, session_id: chatSessionIdRef.current }),
+            });
+            if (res.ok) {
+              const reader = res.body?.getReader();
+              const decoder = new TextDecoder();
+              let buf = '';
+              while (reader) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf += decoder.decode(value, { stream: true });
+                const lines = buf.split('\n');
+                buf = lines.pop() ?? '';
+                for (const line of lines) {
+                  const t = line.trim();
+                  if (!t.startsWith('data:')) continue;
+                  const raw = t.slice(5).trim();
+                  if (raw === '[DONE]') break;
+                  try {
+                    const p = JSON.parse(raw) as { type?: string; data?: string; delta?: string; text?: string; content?: string };
+                    if (p.type === 'done') break;
+                    const chunk = p.data ?? p.delta ?? p.text ?? p.content ?? '';
+                    if (chunk) updateLastAssistantMessage(chunk);
+                  } catch { if (raw) updateLastAssistantMessage(raw); }
+                }
+              }
+            }
+          } finally {
+            setChatStreaming(false);
+          }
+        })();
+      } else if (event.type === 'error') {
+        setCurrentJob({ ...job, status: 'error' });
+        ws.close();
+      }
+    };
+
+    ws.onerror = () => {
+      addEvent({ id: crypto.randomUUID(), type: 'error', message: 'WebSocket connection error', timestamp: new Date() });
+      setCurrentJob({ ...job, status: 'error' });
+    };
+
+    ws.onclose = (ev) => {
+      const latestJob = useAppStore.getState().currentJob;
+      if (latestJob?.status === 'running') {
+        addEvent({ id: crypto.randomUUID(), type: 'error', message: `Connection closed${ev.reason ? ': ' + ev.reason : ''}`, timestamp: new Date() });
+        setCurrentJob({ ...job, status: 'error' });
+      }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentJob?.jobId]);
 
   // Watch pendingAnalyzePath from ProjectManager
   useEffect(() => {
@@ -139,6 +304,41 @@ const TopBar: React.FC = () => {
     setPendingAnalyzePath(null);
     setShowModal(true);
   }, [pendingAnalyzePath, setPendingAnalyzePath]);
+
+  // Freshness check — runs once when project is selected, then every 30s
+  const checkFreshness = useCallback(async (projectId: string) => {
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/freshness`);
+      if (!res.ok) return;
+      const data = await res.json() as {
+        is_fresh: boolean;
+        changed_files: Array<{ path: string; reason: string }>;
+        new_files: Array<{ path: string; reason: string }>;
+        last_analyzed_at: string | null;
+      };
+      const changedCount = data.changed_files.length + data.new_files.length;
+      setFreshnessStatus({
+        isStale: !data.is_fresh,
+        changedCount,
+        lastAnalyzedAt: data.last_analyzed_at,
+        checkedAt: Date.now(),
+      });
+    } catch {
+      // Network error — silently ignore, don't disrupt UX
+    }
+  }, [setFreshnessStatus]);
+
+  useEffect(() => {
+    if (!selectedProject) {
+      setFreshnessStatus(null);
+      return;
+    }
+    // Check immediately when project loads or changes
+    checkFreshness(selectedProject.id);
+    // Then every 30 seconds
+    const interval = setInterval(() => checkFreshness(selectedProject.id), 30_000);
+    return () => clearInterval(interval);
+  }, [selectedProject?.id, checkFreshness, setFreshnessStatus]);
 
   // Pre-scan when path changes (debounced)
   useEffect(() => {
@@ -176,6 +376,39 @@ const TopBar: React.FC = () => {
     }
   };
 
+  const handleRefresh = async () => {
+    if (!selectedProject) return;
+    setIsSubmitting(true);
+    try {
+      const res = await fetch('/api/analyze/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_path: selectedProject.path, project_id: selectedProject.id }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({})) as { detail?: string };
+        throw new Error(body.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json() as { job_id: string; project_id: string };
+      const { job_id: jobId, project_id: projectId } = data;
+
+      clearEvents();
+      resetProgress();
+      // Don't clear file tree — Refresh only re-analyzes a subset of files.
+      // After the job completes, the done handler below will reload the full tree.
+
+      setFreshnessStatus(null);
+
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${wsProtocol}://${window.location.host}/ws/analyze/${jobId}`);
+      setCurrentJob({ jobId, projectId, projectPath: selectedProject.path, status: 'running', ws });
+    } catch (err) {
+      console.error('Refresh failed:', err);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   const handleAnalyze = async () => {
     const projectPath = inputPath.trim();
     if (!projectPath) { setModalError('Please enter a project path.'); return; }
@@ -205,165 +438,14 @@ const TopBar: React.FC = () => {
 
       setSelectedProject({ path: projectPath, id: projectId });
 
-      // Load existing memory from disk so user sees past analysis immediately
-      fetch(`/api/memory/${projectId}`)
-        .then(r => r.json())
-        .then(data => {
-          if (data.modules?.length > 0) {
-            data.modules.forEach((m: any) => addModule({
-              name: m.name ?? m.path?.split('/').pop() ?? 'module',
-              path: m.path ?? '',
-              purpose: m.purpose ?? '',
-              patterns: m.patterns ?? [],
-              key_components: m.key_components ?? [],
-            }));
-            // Reflect loaded modules in progress bar
-            setFilesAnalyzed(data.modules.length);
-            if (data.modules.length > (scanInfo?.analyzable ?? 0)) {
-              setFilesTotal(data.modules.length);
-            }
-          }
-          if (data.patterns?.length > 0) setPatterns(data.patterns);
-        })
-        .catch(() => {/* no memory yet */});
-
       setShowModal(false);
       setInputPath('');
       setScanInfo(null);
 
-      // Reset counter when live analysis starts (don't carry over loaded memory count)
-      setFilesAnalyzed(0);
-
       const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
       const ws = new WebSocket(`${wsProtocol}://${window.location.host}/ws/analyze/${jobId}`);
-      const job: AnalysisJob = { jobId, projectId, projectPath, status: 'running', ws };
-      setCurrentJob(job);
-
-      ws.onmessage = (ev) => {
-        let payload: Record<string, unknown>;
-        try { payload = JSON.parse(ev.data as string); } catch { return; }
-        if (payload.type !== 'agent_event') return;
-
-        const raw = (
-          typeof payload.data === 'object' && payload.data !== null
-            ? payload.data : payload
-        ) as Record<string, unknown>;
-
-        const event: AgentEvent = {
-          id: (raw.id as string) ?? crypto.randomUUID(),
-          type: (raw.type as AgentEvent['type']) ?? 'scan',
-          message: (raw.message as string) ?? '',
-          file: raw.file as string | undefined,
-          summary: raw.summary as string | undefined,
-          data: raw.data as Record<string, unknown> | undefined,
-          timestamp: new Date(),
-        };
-
-        addEvent(event);
-
-        if (event.file) {
-          if (event.type === 'scan') addFileIfMissing(event.file);
-          else if (event.type === 'llm_start') {
-            addFileIfMissing(event.file);
-            updateFileStatus(event.file, 'analyzing');
-          } else if (event.type === 'llm_done') {
-            updateFileStatus(event.file, 'done', event.summary);
-            incrementFilesAnalyzed();
-          } else if (event.type === 'skip') {
-            addFileIfMissing(event.file);
-            updateFileStatus(event.file, 'skipped');
-          }
-        }
-
-        if (event.type === 'memory' && event.data) {
-          const d = event.data;
-          const mod: MemoryModule = {
-            name: (d.name as string) ?? event.file ?? 'module',
-            path: (d.path as string) ?? event.file ?? '',
-            purpose: (d.purpose as string) ?? event.summary ?? '',
-            patterns: Array.isArray(d.patterns) ? (d.patterns as string[]) : [],
-            key_components: Array.isArray(d.key_components) ? (d.key_components as string[]) : [],
-          };
-          addModule(mod);
-        }
-
-        if (event.type === 'pattern') {
-          const pattern = (event.data?.pattern as string) ?? (event.data?.name as string) ?? event.message;
-          if (pattern) addPatternIfMissing(pattern);
-        }
-
-        if (event.type === 'done') {
-          setCurrentJob({ ...job, status: 'complete' });
-          ws.close();
-          // Auto-post summary to chat
-          const filesAnalyzed = (event.data?.files_analyzed as number) ?? 0;
-          const patternsFound = (event.data?.patterns_found as number) ?? 0;
-          const duration = (event.data?.duration_seconds as number) ?? 0;
-          const projectName = projectPath.split('/').filter(Boolean).pop() ?? projectPath;
-          addChatMessage({
-            id: crypto.randomUUID(),
-            role: 'assistant',
-            content: `✅ **Analysis complete** — ${projectName}\n${filesAnalyzed} files analyzed · ${patternsFound} patterns detected · ${duration.toFixed(1)}s\n\nAsk me anything about the architecture.`,
-          });
-          // Trigger LLM summary
-          const autoPrompt = `Summarize the key architectural findings from this analysis in 3-5 bullet points.`;
-          addChatMessage({ id: crypto.randomUUID(), role: 'user', content: autoPrompt });
-          setChatStreaming(true);
-          addChatMessage({ id: crypto.randomUUID(), role: 'assistant', content: '', streaming: true });
-          (async () => {
-            try {
-              const res = await fetch('/api/chat', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: autoPrompt, project_id: projectId, session_id: chatSessionIdRef.current }),
-              });
-              if (res.ok) {
-                const reader = res.body?.getReader();
-                const decoder = new TextDecoder();
-                let buf = '';
-                while (reader) {
-                  const { done, value } = await reader.read();
-                  if (done) break;
-                  buf += decoder.decode(value, { stream: true });
-                  const lines = buf.split('\n');
-                  buf = lines.pop() ?? '';
-                  for (const line of lines) {
-                    const t = line.trim();
-                    if (!t.startsWith('data:')) continue;
-                    const raw = t.slice(5).trim();
-                    if (raw === '[DONE]') break;
-                    try {
-                      const p = JSON.parse(raw) as { type?: string; data?: string; delta?: string; text?: string; content?: string };
-                      if (p.type === 'done') break;
-                      const chunk = p.data ?? p.delta ?? p.text ?? p.content ?? '';
-                      if (chunk) updateLastAssistantMessage(chunk);
-                    } catch { if (raw) updateLastAssistantMessage(raw); }
-                  }
-                }
-              }
-            } finally {
-              setChatStreaming(false);
-            }
-          })();
-        } else if (event.type === 'error') {
-          setCurrentJob({ ...job, status: 'error' });
-          ws.close();
-        }
-      };
-
-      ws.onerror = () => {
-        addEvent({ id: crypto.randomUUID(), type: 'error', message: 'WebSocket connection error', timestamp: new Date() });
-        setCurrentJob({ ...job, status: 'error' });
-      };
-
-      ws.onclose = (ev) => {
-        // If job never reached 'complete', mark as error so UI unblocks
-        const latestJob = useAppStore.getState().currentJob;
-        if (latestJob?.status === 'running') {
-          addEvent({ id: crypto.randomUUID(), type: 'error', message: `Connection closed${ev.reason ? ': ' + ev.reason : ''}`, timestamp: new Date() });
-          setCurrentJob({ ...job, status: 'error' });
-        }
-      };
+      setCurrentJob({ jobId, projectId, projectPath, status: 'running', ws });
+      // Handlers are attached by the useEffect below that watches currentJob.jobId
     } catch (err) {
       setModalError((err as Error).message || 'Failed to start analysis');
     } finally {
@@ -409,6 +491,29 @@ const TopBar: React.FC = () => {
                 }}
               >✕</button>
             </span>
+          )}
+          {!isRunning && freshnessStatus?.isStale && appView === 'workspace' && (
+            <button
+              className="topbar-freshness-stale topbar-freshness-btn"
+              title={`${freshnessStatus.changedCount} 個檔案已變動，點擊執行增量刷新`}
+              onClick={handleRefresh}
+              disabled={isSubmitting}
+            >
+              ⚡ {freshnessStatus.changedCount} 變動
+            </button>
+          )}
+          {!isRunning && freshnessStatus && !freshnessStatus.isStale && appView === 'workspace' && (
+            <span className="topbar-freshness-fresh" title="所有追蹤檔案均為最新">✅ 最新</span>
+          )}
+          {appView === 'workspace' && selectedProject && (
+            <button
+              className="topbar-btn"
+              onClick={handleRefresh}
+              disabled={isRunning || isSubmitting}
+              title="只重新分析新增或變動的檔案"
+            >
+              ⚡ Refresh
+            </button>
           )}
           {appView === 'workspace' && (
             <button className="topbar-btn analyze" onClick={() => { setModalError(''); setShowModal(true); }} disabled={isRunning}>

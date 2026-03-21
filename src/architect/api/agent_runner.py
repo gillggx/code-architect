@@ -18,11 +18,16 @@ In interactive mode the runner stores an asyncio.Event in the session; the
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
 import os
+import shutil
+import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional, Any
 from uuid import uuid4
 
@@ -36,7 +41,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 AGENT_MODEL = os.getenv("DEFAULT_LLM_MODEL", "anthropic/claude-sonnet-4-5")
 CHUNK_SIZE = 12  # Max plan steps per execution phase
-APPROVAL_TIMEOUT = 300  # 5 minutes
+APPROVAL_TIMEOUT = 900  # 15 minutes
+MAX_LINT_RETRIES = 3    # self-correction attempts per file
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +336,53 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "syntax_lint",
+            "description": "Check a file for syntax errors after editing. Returns 'Syntax OK' or a SyntaxError message.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to project root",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "think",
+            "description": (
+                "REQUIRED before every write_file or edit_file. "
+                "Use this to reason explicitly about your next change. "
+                "State what you know from reading, exactly what you will change, "
+                "and why it is the minimum necessary change."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "what_i_know": {
+                        "type": "string",
+                        "description": "Key facts learned from reading files relevant to this change",
+                    },
+                    "what_i_will_change": {
+                        "type": "string",
+                        "description": "Exact file path and specific lines/section to modify",
+                    },
+                    "minimum_justification": {
+                        "type": "string",
+                        "description": "Why this is the minimum change needed to satisfy the task",
+                    },
+                },
+                "required": ["what_i_know", "what_i_will_change", "minimum_justification"],
+            },
+        },
+    },
 ]
 
 
@@ -374,6 +427,10 @@ class AgentRunner:
         self._changes: List[FileChange] = []
         self._plan: List[str] = []
         self._session: Optional[AgentSession] = None
+        self._syntax_retries: Dict[str, int] = {}     # path → retry count
+        self._files_read: set = set()                  # normalized paths read this session
+        self._working_memory: Dict[str, str] = {}      # path → key facts snippet
+        self._last_tool_was_think: bool = False        # think() called before last write?
 
         # Lazy-init openai client
         self._oai = None
@@ -431,6 +488,62 @@ class AgentRunner:
             )
         return self._oai
 
+    @staticmethod
+    def _lint_file(path: str, project_path: str) -> dict:
+        """Run static syntax check on a file. Returns {ok, error?, line?, skipped?}."""
+        from .tools.file_tools import _resolve
+        try:
+            resolved = _resolve(path, project_path)
+            if not resolved.exists():
+                return {"ok": True, "skipped": True}
+            source = resolved.read_text(encoding="utf-8", errors="replace")
+            suffix = resolved.suffix.lower()
+            if suffix == ".py":
+                try:
+                    ast.parse(source)
+                    return {"ok": True}
+                except SyntaxError as exc:
+                    return {"ok": False, "error": str(exc), "line": exc.lineno}
+            elif suffix in (".ts", ".tsx", ".js", ".jsx"):
+                try:
+                    result = subprocess.run(
+                        ["tsc", "--noEmit", "--allowJs", "--syntaxOnly", str(resolved)],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    if result.returncode != 0:
+                        err = (result.stdout + result.stderr).strip()[:500]
+                        return {"ok": False, "error": err}
+                    return {"ok": True}
+                except FileNotFoundError:
+                    return {"ok": True, "skipped": True}  # tsc not installed
+                except subprocess.TimeoutExpired:
+                    return {"ok": True, "skipped": True}
+            else:
+                return {"ok": True, "skipped": True}
+        except Exception as exc:
+            logger.warning("Lint check failed for %s: %s", path, exc)
+            return {"ok": True, "skipped": True}
+
+    @staticmethod
+    def _backup_file(path: str, project_path: str) -> None:
+        """Copy original file to .architect/backup/ before overwriting."""
+        from .tools.file_tools import _resolve
+        try:
+            resolved = _resolve(path, project_path)
+            if not resolved.exists():
+                return
+            backup_dir = Path(project_path) / ".architect" / "backup"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            # Count existing backups to enforce soft cap
+            existing = list(backup_dir.glob("*"))
+            if len(existing) >= 50:
+                return
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_name = str(Path(path).as_posix()).replace("/", "__")
+            shutil.copy2(resolved, backup_dir / f"{safe_name}.{timestamp}")
+        except Exception as exc:
+            logger.warning("Backup failed for %s: %s", path, exc)
+
     def _build_system_prompt(self) -> str:
         lines = [
             "You are Code Architect Agent — an expert software engineer.",
@@ -463,12 +576,59 @@ class AgentRunner:
             "## Agent Soul & Personality",
             self._soul,
             "",
-            "## Rules",
-            "- Read files before editing them.",
-            "- Use edit_file for targeted changes, write_file for new files or rewrites.",
-            "- Run tests/linters after making changes to verify correctness.",
-            "- When done, provide a concise summary of what you changed and why.",
-            "- Never write to .env, .key, .pem files or files matching secrets.*",
+            "## Operational Rules (MANDATORY — violations cause incorrect output)",
+            "",
+            "### Explore First",
+            "- Before making ANY edit, you MUST call list_files or read_file at least once.",
+            "- Never jump directly to write_file or edit_file without reading context.",
+            "",
+            "### No Guessing",
+            "- NEVER guess variable names, function signatures, or import paths.",
+            "- If unsure, call search_code or read_file to verify. Always.",
+            "",
+            "### Incremental Edits",
+            "- Prefer edit_file (targeted replacement) over write_file (full overwrite).",
+            "- Make one logical change at a time and verify before the next.",
+            "- Use write_file only for new files or when a full rewrite is clearly needed.",
+            "",
+            "### Dependency Awareness",
+            "- Before changing a function/class, call search_code to find all callers.",
+            "- Consider side-effects on dependent modules before applying changes.",
+            "",
+            "### Syntax Verification",
+            "- After every edit_file or write_file, call syntax_lint on the modified file.",
+            "- If syntax_lint reports an error, fix it immediately before continuing.",
+            "",
+            "### Task Scope — YAGNI (CRITICAL)",
+            "- ONLY create or modify files DIRECTLY required by the user's request.",
+            "- NEVER create analysis files, recommendation files, documentation files,",
+            "  TODO files, or summary reports unless the user explicitly asked for them.",
+            "- If unsure whether a file is needed: do NOT create it.",
+            "- The task is complete when the user's request is satisfied. Stop immediately.",
+            "- Count your changes. More than 3 files changed for a simple request = you over-scoped.",
+            "",
+            "### Before Every Edit (MANDATORY SEQUENCE)",
+            "1. read_file(path) — read the target file",
+            "2. think(what_i_know, what_i_will_change, minimum_justification) — reason explicitly",
+            "3. edit_file(path, old_str, new_str) — make the targeted change",
+            "This sequence is ENFORCED. Skipping any step will be blocked.",
+            "",
+            "### Security",
+            "- Never write to .env, .key, .pem, secrets.*, or any file outside project root.",
+            "",
+            "### Allowed shell commands (run_command allowlist)",
+            "Only the following commands are permitted. Using anything else will be rejected:",
+            "  Tests:       pytest, python -m pytest, npm test, npm run test, yarn test",
+            "  Linters:     ruff, mypy, eslint, tsc, pyright, npm run lint, yarn lint",
+            "  Build:       npm run build, yarn build, pnpm build, cargo build, go build",
+            "  Install:     pip install, npm install, npm ci, uv pip, poetry install",
+            "  Git (read):  git status, git diff, git log, git show, git blame",
+            "  Filesystem:  ls, find, cat, head, tail, grep, wc, mkdir",
+            "  Other:       go test, cargo test, bun test",
+            "  All of the above also accept: cd <path> && <cmd>",
+            "",
+            "### Completion",
+            "- When done, provide a concise summary of what changed and why.",
         ]
 
         return "\n".join(lines)
@@ -795,13 +955,23 @@ Now generate the real plan for the task above. You may include plan_b if there i
                     yield ToolCallEvent(type="done", content="Stopped by user.", changes=self._changes)
                     return
 
+                # Inject working memory as a fresh system message before each LLM call
+                call_messages = list(messages)
+                if self._working_memory:
+                    mem_lines = [f"  - {p}: {s[:150]}" for p, s in self._working_memory.items()]
+                    mem_block = "## Files read this session (key facts):\n" + "\n".join(mem_lines)
+                    # Insert after the first system message
+                    call_messages.insert(1, {"role": "system", "content": mem_block})
+                else:
+                    call_messages = messages
+
                 # Force tool use on first iteration so agent doesn't just output analysis text
                 tc_mode = "required" if iteration == 0 else "auto"
 
                 try:
                     response = await client.chat.completions.create(
                         model=AGENT_MODEL,
-                        messages=messages,
+                        messages=call_messages,
                         tools=TOOL_DEFINITIONS,
                         tool_choice=tc_mode,
                         max_tokens=4096,
@@ -851,6 +1021,65 @@ Now generate the real plan for the task above. You may include plan_b if there i
                         fn_args = {}
 
                     yield ToolCallEvent(type="tool_call", tool=fn_name, args=fn_args)
+
+                    # Validate required args before approval — short-circuit if missing
+                    _arg_error: Optional[str] = None
+                    if fn_name == "write_file" and not fn_args.get("path", "").strip():
+                        _arg_error = "Error: write_file requires a 'path' argument — please specify the file path."
+                    elif fn_name == "edit_file" and not fn_args.get("path", "").strip():
+                        _arg_error = "Error: edit_file requires a 'path' argument — please specify the file path."
+                    elif fn_name == "edit_file" and not fn_args.get("old_str", ""):
+                        _arg_error = "Error: edit_file requires an 'old_str' argument — the exact string to replace."
+                    elif fn_name == "run_command" and not fn_args.get("cmd", "").strip():
+                        _arg_error = "Error: run_command requires a 'cmd' argument — please specify the command."
+                    if _arg_error:
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": _arg_error})
+                        yield ToolCallEvent(type="tool_output", tool=fn_name, result=_arg_error)
+                        continue
+
+                    # ── Read-before-write enforcement ─────────────────────────
+                    if fn_name in ("write_file", "edit_file"):
+                        _norm = Path(fn_args.get("path", "")).as_posix()
+                        _target = Path(self.project_path) / _norm
+                        if _target.exists() and _norm not in self._files_read:
+                            _rbw_err = (
+                                f"BLOCKED: You have not read '{_norm}' yet. "
+                                f"Call read_file(path='{_norm}') first, then retry."
+                            )
+                            messages.append({"role": "tool", "tool_call_id": tc.id, "content": _rbw_err})
+                            yield ToolCallEvent(type="tool_output", tool=fn_name, result=_rbw_err)
+                            continue
+
+                    # ── write_file hard block on existing large files ──────────
+                    if fn_name == "write_file":
+                        _norm = Path(fn_args.get("path", "")).as_posix()
+                        _target = Path(self.project_path) / _norm
+                        if _target.exists():
+                            try:
+                                _line_count = len(_target.read_text(encoding="utf-8", errors="replace").splitlines())
+                            except Exception:
+                                _line_count = 0
+                            if _line_count > 20:
+                                _wf_err = (
+                                    f"HARD BLOCK: '{_norm}' already exists ({_line_count} lines). "
+                                    "write_file is not allowed on existing files. "
+                                    "Use edit_file(path, old_str, new_str) for targeted changes. "
+                                    "Read the file first if needed, then use edit_file."
+                                )
+                                messages.append({"role": "tool", "tool_call_id": tc.id, "content": _wf_err})
+                                yield ToolCallEvent(type="tool_output", tool=fn_name, result=_wf_err)
+                                continue
+
+                    # ── think-before-write enforcement ───────────────────────
+                    if fn_name in ("write_file", "edit_file") and not self._last_tool_was_think:
+                        _think_err = (
+                            f"BLOCKED: You must call think() before {fn_name}. "
+                            "State what_i_know, what_i_will_change, and minimum_justification, "
+                            "then retry the edit."
+                        )
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": _think_err})
+                        yield ToolCallEvent(type="tool_output", tool=fn_name, result=_think_err)
+                        continue
 
                     # For mutating tools in interactive mode: request approval
                     is_mutating = fn_name in ("write_file", "edit_file", "run_command")
@@ -940,6 +1169,37 @@ Now generate the real plan for the task above. You may include plan_b if there i
                     if file_change:
                         self._changes.append(file_change)
 
+                    # Auto-lint after successful write/edit
+                    if (
+                        file_change
+                        and file_change.applied
+                        and fn_name in ("write_file", "edit_file")
+                    ):
+                        lint = AgentRunner._lint_file(file_change.file, self.project_path)
+                        if not lint.get("skipped"):
+                            if lint["ok"]:
+                                lint_msg = f"Syntax OK: {file_change.file}"
+                                tool_result = f"{tool_result} | {lint_msg}"
+                            else:
+                                err = lint.get("error", "unknown")
+                                line = lint.get("line")
+                                line_info = f" at line {line}" if line else ""
+                                lint_msg = f"SyntaxError{line_info}: {err}"
+                                retry_count = self._syntax_retries.get(file_change.file, 0) + 1
+                                self._syntax_retries[file_change.file] = retry_count
+                                if retry_count >= MAX_LINT_RETRIES:
+                                    yield ToolCallEvent(
+                                        type="error",
+                                        error=f"Syntax fix failed after {MAX_LINT_RETRIES} attempts on {file_change.file}: {err}",
+                                    )
+                                    if self._session:
+                                        self._session.status = "error"
+                                    return
+                                tool_result = (
+                                    f"{tool_result} | LINT FAILED (attempt {retry_count}/{MAX_LINT_RETRIES}): "
+                                    f"{lint_msg}. Fix the syntax error before continuing."
+                                )
+
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -1001,9 +1261,20 @@ Now generate the real plan for the task above. You may include plan_b if there i
         pp = self.project_path
 
         try:
+            # Reset think gate for every tool that is not think itself
+            if fn_name != "think":
+                self._last_tool_was_think = False
+
             if fn_name == "read_file":
                 path = fn_args["path"]
                 content = read_file(path, pp)
+                # Record as read (for read-before-write enforcement)
+                normalized = Path(path).as_posix()
+                self._files_read.add(normalized)
+                # Store first 400 chars as working memory snippet
+                snippet = content[:400].replace('\n', ' ').strip()
+                if snippet:
+                    self._working_memory[normalized] = snippet
                 # Truncate for messages to avoid token blow-up
                 if len(content) > 8000:
                     content = content[:8000] + "\n... (truncated)"
@@ -1028,8 +1299,10 @@ Now generate the real plan for the task above. You may include plan_b if there i
                 return git_diff(pp, path), None
 
             elif fn_name == "write_file":
-                path = fn_args["path"]
-                new_content = fn_args["content"]
+                path = fn_args.get("path", "").strip()
+                new_content = fn_args.get("content", "")
+                if not path:
+                    return "Error: write_file requires a 'path' argument — please specify the file path.", None
 
                 # Compute diff
                 from .tools.file_tools import _resolve
@@ -1052,6 +1325,7 @@ Now generate the real plan for the task above. You may include plan_b if there i
                 )
 
                 if self.mode in ("apply", "interactive"):
+                    AgentRunner._backup_file(path, pp)
                     write_file(path, new_content, pp)
                     fc.applied = True
                     return f"Written {path}", fc
@@ -1060,9 +1334,13 @@ Now generate the real plan for the task above. You may include plan_b if there i
                 return f"[dry_run] Would write {path} ({len(new_content)} chars)", fc
 
             elif fn_name == "edit_file":
-                path = fn_args["path"]
-                old_str = fn_args["old_str"]
-                new_str = fn_args["new_str"]
+                path = fn_args.get("path", "").strip()
+                old_str = fn_args.get("old_str", "")
+                new_str = fn_args.get("new_str", "")
+                if not path:
+                    return "Error: edit_file requires a 'path' argument — please specify the file path.", None
+                if not old_str:
+                    return "Error: edit_file requires an 'old_str' argument — the exact string to replace.", None
 
                 from .tools.file_tools import _resolve
                 resolved = _resolve(path, pp)
@@ -1079,14 +1357,44 @@ Now generate the real plan for the task above. You may include plan_b if there i
                 )
 
                 if self.mode in ("apply", "interactive"):
+                    AgentRunner._backup_file(path, pp)
                     edit_file(path, old_str, new_str, pp)
                     fc.applied = True
                     return f"Edited {path}", fc
 
                 return f"[dry_run] Would edit {path}", fc
 
+            elif fn_name == "think":
+                # Reset flag for all other tools (non-think resets the gate)
+                what_i_know = fn_args.get("what_i_know", "")
+                what_i_will_change = fn_args.get("what_i_will_change", "")
+                minimum_justification = fn_args.get("minimum_justification", "")
+                if not (what_i_know and what_i_will_change and minimum_justification):
+                    return "Error: think() requires all three fields: what_i_know, what_i_will_change, minimum_justification.", None
+                self._last_tool_was_think = True
+                return (
+                    f"Thought recorded. Proceed with your change.\n"
+                    f"Know: {what_i_know[:200]}\n"
+                    f"Will change: {what_i_will_change[:200]}\n"
+                    f"Justification: {minimum_justification[:200]}"
+                ), None
+
+            elif fn_name == "syntax_lint":
+                path = fn_args["path"]
+                lint_result = AgentRunner._lint_file(path, pp)
+                if lint_result.get("skipped"):
+                    return f"Lint skipped (unsupported file type or linter not installed): {path}", None
+                if lint_result["ok"]:
+                    return f"Syntax OK: {path}", None
+                err = lint_result.get("error", "unknown error")
+                line = lint_result.get("line")
+                line_info = f" at line {line}" if line else ""
+                return f"SyntaxError{line_info}: {err}", None
+
             elif fn_name == "run_command":
-                cmd = fn_args["cmd"]
+                cmd = fn_args.get("cmd", "").strip()
+                if not cmd:
+                    return "Error: run_command requires a 'cmd' argument — please specify the command to run.", None
                 timeout = fn_args.get("timeout", 30)
 
                 if self.mode == "dry_run":

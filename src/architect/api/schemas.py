@@ -418,6 +418,7 @@ class ChatRequest(BaseModel):
     project_id: Optional[str] = Field(None, description="Project context")
     session_id: str = Field(description="Conversation session ID")
     model: Optional[str] = Field(None, description="Override LLM model")
+    system_override: Optional[str] = Field(None, description="Override system prompt (used by Explain Selection)")
 
 
 # ============================================================================
@@ -647,3 +648,8 @@ class EscalationRequest(BaseModel):
     session_id: str
     action: str  # "alternative" | "manual_fix" | "stop"
     instruction: Optional[str] = None
+
+
+class RevertRequest(BaseModel):
+    project_path: str   # absolute project root
+    file_path: str      # relative path within project to restore

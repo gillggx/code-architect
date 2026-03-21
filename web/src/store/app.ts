@@ -131,6 +131,13 @@ export interface ProjectRecord {
   module_count: number;
 }
 
+export interface FreshnessStatus {
+  isStale: boolean;
+  changedCount: number;  // changed + new files
+  lastAnalyzedAt: string | null;
+  checkedAt: number;  // Date.now()
+}
+
 // ---------------------------------------------------------------------------
 // Store interface
 // ---------------------------------------------------------------------------
@@ -190,8 +197,12 @@ interface AppStore {
   setDarkMode: (v: boolean) => void;
 
   // Center panel tab
-  centerTab: 'activity' | 'chat';
-  setCenterTab: (tab: 'activity' | 'chat') => void;
+  centerTab: 'activity' | 'chat' | 'file' | 'graph';
+  setCenterTab: (tab: 'activity' | 'chat' | 'file' | 'graph') => void;
+
+  // Opened file in editor tab
+  openedFile: { path: string; projectId: string } | null;
+  setOpenedFile: (f: { path: string; projectId: string } | null) => void;
 
   // Edit agent state
   editMode: boolean;
@@ -231,6 +242,10 @@ interface AppStore {
   // Pending analyze path (from ProjectManager -> TopBar)
   pendingAnalyzePath: string | null;
   setPendingAnalyzePath: (p: string | null) => void;
+
+  // Freshness status
+  freshnessStatus: FreshnessStatus | null;
+  setFreshnessStatus: (s: FreshnessStatus | null) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -320,8 +335,12 @@ export const useAppStore = create<AppStore>((set) => ({
   setDarkMode: (v) => set({ darkMode: v }),
 
   // Center panel tab
-  centerTab: 'activity',
+  centerTab: 'activity' as 'activity' | 'chat' | 'file' | 'graph',
   setCenterTab: (tab) => set({ centerTab: tab }),
+
+  // Opened file
+  openedFile: null,
+  setOpenedFile: (f) => set({ openedFile: f }),
 
   // Edit agent state
   editMode: false,
@@ -381,6 +400,10 @@ export const useAppStore = create<AppStore>((set) => ({
   // Pending analyze path
   pendingAnalyzePath: null,
   setPendingAnalyzePath: (p) => set({ pendingAnalyzePath: p }),
+
+  // Freshness status
+  freshnessStatus: null,
+  setFreshnessStatus: (s) => set({ freshnessStatus: s }),
 }));
 
 // ---------------------------------------------------------------------------
