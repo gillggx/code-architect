@@ -37,8 +37,27 @@ ALLOWED_COMMANDS: List[str] = [
     r"eslint(\s|$)",
     r"tsc(\s|$)",
     r"pyright(\s|$)",
-    # Git read-only
+    # Dependency installation
+    r"npm\s+install(\s|$)",
+    r"npm\s+ci(\s|$)",
+    r"pip\s+install(\s|$)",
+    r"pip3\s+install(\s|$)",
+    r"python\s+-m\s+pip(\s|$)",
+    r"python3\s+-m\s+pip(\s|$)",
+    r"python\s+-m\s+venv(\s|$)",
+    r"python3\s+-m\s+venv(\s|$)",
+    r"uv\s+(pip|venv|sync|add|run)(\s|$)",
+    r"poetry\s+(install|add|run)(\s|$)",
+    r"pnpm\s+install(\s|$)",
+    r"yarn\s+install(\s|$)",
+    r"bun\s+install(\s|$)",
+    r"cargo\s+build(\s|$)",
+    r"go\s+(mod|get|build)(\s|$)",
+    # Git (read-only + init)
+    r"git\s+init(\s|$)",
     r"git\s+(status|diff|log|show|blame)(\s|$)",
+    # Directory creation
+    r"mkdir(\s|$)",
     # File exploration (read-only)
     r"find(\s|$)",
     r"ls(\s|$)",
