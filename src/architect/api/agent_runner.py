@@ -636,6 +636,26 @@ class AgentRunner:
                     lines.append(entry)
             lines.append("")
 
+        else:
+            lines += [
+                "## ⚠️ WARNING: Project memory is EMPTY",
+                "The architecture analysis for this project has not been run or has not completed yet.",
+                "You have NO prior knowledge of this codebase's structure, modules, or patterns.",
+                "",
+                "### STRICT RULES when memory is empty (violations will be rejected):",
+                "- You MUST call list_files and read_file to understand existing code BEFORE writing anything.",
+                "- NEVER write hardcoded, mock, simulated, or example data as a substitute for real implementation.",
+                "- NEVER use placeholder values (e.g. hardcoded prices, fake news articles, random numbers,",
+                "  static JSON blobs) to make code 'appear' functional. This is explicitly forbidden.",
+                "- If implementing a feature requires an external data source (REST API, RSS feed, database,",
+                "  websocket, etc.), you MUST either:",
+                "  1. Write a real integration using appropriate libraries (httpx, feedparser, requests, etc.), OR",
+                "  2. Write a skeleton with raise NotImplementedError and a clear docstring describing exactly",
+                "     what endpoint/library needs to be connected.",
+                "- When in doubt: write skeleton code with explicit TODO comments, NOT fake data.",
+                "",
+            ]
+
         if self.context:
             lines.append("## Additional context")
             lines.append(self.context)
