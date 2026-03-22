@@ -1327,6 +1327,45 @@ def create_app(debug: bool = False) -> FastAPI:
                 field="project_id",
             )
 
+        if not project_modules and not request.force_generate:
+            raise HTTPException(
+                status_code=428,
+                detail={
+                    "error": "project_memory_empty",
+                    "message": (
+                        f"Project '{request.project_id}' has no architecture memory. "
+                        "The agent cannot generate reliable code without it — "
+                        "it will produce hardcoded/mock data instead of real implementations."
+                    ),
+                    "remediation": {
+                        "step_1": {
+                            "description": "Trigger analysis to build architecture memory",
+                            "method": "POST",
+                            "path": "/api/analyze",
+                            "body": {
+                                "project_id": request.project_id,
+                                "project_path": project_path,
+                            },
+                        },
+                        "step_2": {
+                            "description": "Wait for analysis to complete (poll or listen to SSE)",
+                            "method": "GET",
+                            "path": f"/api/projects/{request.project_id}/freshness",
+                        },
+                        "step_3": {
+                            "description": "Retry generate after analysis completes",
+                            "method": "POST",
+                            "path": "/api/a2a/generate",
+                        },
+                    },
+                    "tip": (
+                        "Alternatively, include explicit implementation details in your task "
+                        "(e.g. 'use httpx to fetch from https://...', 'parse RSS with feedparser') "
+                        "and set force_generate=true to bypass this check."
+                    ),
+                },
+            )
+
         if request.mode == "interactive":
             session_id = str(uuid4())
             runner = AgentRunner(

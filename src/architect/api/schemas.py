@@ -509,6 +509,13 @@ class GenerateRequest(BaseModel):
         False,
         description="Auto-apply all file changes without asking for approval",
     )
+    force_generate: bool = Field(
+        False,
+        description=(
+            "Bypass the empty-memory 428 guard. Use only when the task itself "
+            "contains explicit implementation details (API URLs, libraries, etc.)."
+        ),
+    )
 
 
 class FileChangeSchema(BaseModel):
