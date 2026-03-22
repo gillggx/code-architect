@@ -1543,8 +1543,11 @@ def create_app(debug: bool = False) -> FastAPI:
 
                 async def _run_analysis(job_id: str, project_path: str, project_id: str) -> None:
                     try:
-                        analyzer = create_llm_analyzer()
-                        summary = await analyzer.analyze_project(project_path, project_id=project_id)
+                        async def _noop_event(evt: AgentEvent) -> None:
+                            pass
+                        analyzer = create_llm_analyzer(on_event=_noop_event)
+                        _mem_dir = os.path.join("architect_memory", project_id)
+                        summary = await analyzer.analyze_project(project_path, memory_dir=_mem_dir)
                         _app_state.active_jobs[job_id]["status"] = "complete"
                         _app_state.active_jobs[job_id]["summary"] = summary
                     except Exception as _exc:
