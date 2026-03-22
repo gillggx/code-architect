@@ -100,12 +100,23 @@ export interface FileNode {
   children?: FileNode[];
 }
 
+export interface MemorySymbol {
+  name: string;
+  type: string;       // "function" | "class" | "method" | "interface" | "variable"
+  line_start: number;
+  line_end: number;
+  signature: string;
+}
+
 export interface MemoryModule {
   name: string;
   path: string;
   purpose: string;
   patterns: string[];
   key_components: string[];
+  symbols?: MemorySymbol[];
+  edit_hints?: string;
+  imported_by?: string[];
 }
 
 export interface ChatMessage {
@@ -201,8 +212,8 @@ interface AppStore {
   setCenterTab: (tab: 'activity' | 'chat' | 'file' | 'graph') => void;
 
   // Opened file in editor tab
-  openedFile: { path: string; projectId: string } | null;
-  setOpenedFile: (f: { path: string; projectId: string } | null) => void;
+  openedFile: { path: string; projectId: string; line?: number } | null;
+  setOpenedFile: (f: { path: string; projectId: string; line?: number } | null) => void;
 
   // Edit agent state
   editMode: boolean;

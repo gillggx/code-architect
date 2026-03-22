@@ -32,13 +32,26 @@ An AI-powered codebase analysis and agentic coding tool. Point it at any project
 - **Escalation Loop** — tool failure → auto-switch to Plan B → human escalation with custom instruction
 - **Built-in tools** — read/write/edit files, git status/diff, shell commands, code search
 - **Shell allowlist** — test runners, linters, git, find, ls, cat, grep; bypass with `AGENT_SHELL_UNRESTRICTED=true`
-- **40-iteration limit** — per phase, so large multi-phase tasks are not cut off
+- **50-iteration hard cap** — per phase, with stall detection: identical (tool, args) calls 3× in a row inject a forced-progress warning
+- **no-op guard** — `edit_file` rejects calls where `old_str == new_str` before touching disk
+- **Impact Preview** — before executing any edit task, calls `/api/a2a/impact` and shows predicted file changes with confidence bars; user confirms or cancels
+- **Git Checkpoint** — on first mutating tool call, creates `architect/task-{id}` branch; pre-task dirty tree saved as named stash; one-click Rollback in the UI restores original state
+- **Semantic Context Window** — recent files in the conversation are hydrated with their symbols and `imported_by` graph into a dynamic `## Active Context` block; conversation summaries injected when messages exceed 20
+- **Architecture Linter** — enforces `.architect-rules.yml` rules (forbidden/required imports per file glob) after every write; violations block continuation with auto-suggested memory alternatives
+- **Sticky Context** — after each successful edit, the module's `edit_hints` field is updated with a timestamped summary so future agent calls see what changed
+- **Task Briefing** — at the start of every task the agent emits a structured plan card listing all steps, confidence, and risk level; Activity Feed shows an animated "currently on step N" bar
+
+### Memory Panel
+- **Symbol navigation** — each module shows its functions/classes/variables; click any symbol to jump to that line in the file viewer
+- **Used by N badge** — modules show how many other modules import them; N≥5 highlighted as a hot spot
+- **File context mode** — when a file is open in the editor, Memory Panel automatically focuses on that file's memory record with full symbols, edit hints, and patterns; toggle back to full list
 
 ### A2A API
 - **Architecture query** — `POST /api/a2a/query` — other agents can ask architecture questions
-- **Code generation** — `POST /api/a2a/generate`
+- **Code generation** — `POST /api/a2a/generate` — SSE stream of agent events
 - **Validation** — `POST /api/a2a/validate`
-- **Impact analysis** — `POST /api/a2a/impact`
+- **Impact analysis** — `POST /api/a2a/impact` — predicts which files a change will affect
+- **Rollback** — `POST /api/agent/rollback-session-v2` — restores workspace to pre-task state
 
 ---
 
@@ -96,21 +109,59 @@ Opens:
 ```
 code-architect/
 ├── src/architect/
-│   ├── api/           # FastAPI routes, agent runner, tools, SOUL loader
-│   │   └── tools/     # file_tools, shell_tools (with allowlist)
-│   ├── analysis/      # LLM file analyzer (chunked), large project handler
-│   ├── llm/           # LLM client, model router, chat engine (git context)
-│   ├── memory/        # 3-tier memory (hot cache, markdown, vectors)
-│   ├── patterns/      # Design pattern detector
-│   ├── projects/      # Project manager
-│   └── rag/           # Hybrid BM25 + vector search
-├── web/               # React + TypeScript frontend
-│   └── src/
-│       ├── components/ # FileTree, AgentActivityFeed, ChatBar, PlanCard, EscalationCard, MemoryPanel
-│       └── store/      # Zustand app state
-├── start.sh           # One-command start
-└── .env               # API keys and model selection
+│   ├── api/
+│   │   ├── agent_runner.py   # Agentic loop — planning, tool execution, git checkpoint, linter
+│   │   ├── arch_linter.py    # Architecture rules engine (.architect-rules.yml)
+│   │   ├── diff.py           # Unified diff helpers
+│   │   ├── main.py           # FastAPI routes
+│   │   ├── schemas.py        # Pydantic request/response models
+│   │   └── tools/            # file_tools, shell_tools (allowlist), search_tools, git_tools
+│   ├── analysis/             # LLM file analyzer (chunked), large project handler
+│   ├── codegen/              # Code generation helpers
+│   ├── llm/                  # LLM client, model router, chat engine (git context)
+│   ├── memory/               # 3-tier memory (hot cache, markdown, vectors)
+│   ├── patterns/             # Design pattern detector
+│   ├── projects/             # Project manager
+│   └── rag/                  # Hybrid BM25 + vector search
+├── web/src/
+│   ├── components/
+│   │   ├── AgentActivityFeed.tsx  # Activity/Chat/File/Graph tabs + briefing card + step bar
+│   │   ├── ChatBar.tsx            # Chat/Edit mode input + Impact Preview modal
+│   │   ├── MemoryPanel.tsx        # Module list + symbol navigation + used-by badge
+│   │   ├── PlanCard.tsx           # Plan A/B approval card
+│   │   ├── EscalationCard.tsx     # Tool failure escalation UI
+│   │   ├── TopBar.tsx             # Project selector + rollback button + freshness indicator
+│   │   └── FileEditor.tsx         # In-panel file viewer (click-to-line)
+│   └── store/app.ts               # Zustand state (projects, memory, chat, agent session)
+├── master_prd_sprint3_sprint4.md  # Sprint 3-4 feature spec
+├── start.sh                       # One-command start
+└── .env                           # API keys and model selection
 ```
+
+---
+
+## .architect-rules.yml
+
+Place an `.architect-rules.yml` at the root of your analyzed project to enforce import rules. The agent checks every file it edits and blocks violations before they land.
+
+```yaml
+rules:
+  - id: no-direct-db
+    description: "Services must not import database models directly"
+    match_files: "src/services/**/*.py"
+    forbidden_imports:
+      - "src/models/*"
+      - "src/db/*"
+    fix_hint: "Import via a repository layer instead"
+
+  - id: require-logging
+    description: "All API handlers must import the logger"
+    match_files: "src/api/**/*.py"
+    required_imports:
+      - "logging"
+```
+
+When a violation is detected, the agent also searches project memory for a suitable alternative module (e.g. a `*service*` or `*facade*` file that wraps the forbidden resource) and suggests it alongside the violation message.
 
 ---
 
@@ -178,3 +229,4 @@ The edit agent also accepts `chat_history` for context:
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter endpoint |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama fallback |
 | `AGENT_SHELL_UNRESTRICTED` | `false` | Bypass shell command allowlist (dev only) |
+| `DEFAULT_LLM_MODEL` | `anthropic/claude-sonnet-4-5` | Model for analysis, chat, and edit agent |

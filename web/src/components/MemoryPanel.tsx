@@ -7,7 +7,22 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { useMemory, useAppStore, MemoryModule } from '../store/app';
+import { useMemory, useAppStore, MemoryModule, MemorySymbol } from '../store/app';
+
+// ---------------------------------------------------------------------------
+// Symbol type icons
+// ---------------------------------------------------------------------------
+const SYMBOL_ICON: Record<string, string> = {
+  function: 'ƒ',
+  method: 'ƒ',
+  class: 'C',
+  interface: 'I',
+  variable: 'v',
+};
+
+function symbolIcon(type: string): string {
+  return SYMBOL_ICON[type.toLowerCase()] ?? '·';
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -34,16 +49,41 @@ const ModuleCard: React.FC<{ mod: MemoryModule }> = ({ mod }) => {
   const [expanded, setExpanded] = useState(false);
   const shortPath = mod.path.length > 42 ? '…' + mod.path.slice(-42) : mod.path;
   const hasError = isErrorPurpose(mod.purpose);
+  const hasSymbols = (mod.symbols?.length ?? 0) > 0;
+  const usedByCount = mod.imported_by?.length ?? 0;
+
+  const setOpenedFile = useAppStore(s => s.setOpenedFile);
+  const setCenterTab = useAppStore(s => s.setCenterTab);
+  const selectedProject = useAppStore(s => s.selectedProject);
+
+  const handleSymbolClick = (sym: MemorySymbol) => {
+    if (!selectedProject) return;
+    setOpenedFile({ path: mod.path, projectId: selectedProject.id, line: sym.line_start });
+    setCenterTab('file');
+  };
 
   return (
     <div className={`memory-module-card${hasError ? ' memory-module-card-error' : ''}`}>
-      <div className="memory-module-header">
+      <div className="memory-module-header" onClick={() => hasSymbols && setExpanded(v => !v)} style={{ cursor: hasSymbols ? 'pointer' : 'default' }}>
         <span className="memory-module-name">{mod.name}</span>
         <span className="memory-module-path" title={mod.path}>{shortPath}</span>
+        {usedByCount > 0 && (
+          <span
+            className={`memory-usedby-badge${usedByCount >= 5 ? ' hot' : ''}`}
+            title={`Used by ${usedByCount} module${usedByCount !== 1 ? 's' : ''}: ${mod.imported_by!.join(', ')}`}
+          >
+            ↑{usedByCount}
+          </span>
+        )}
+        {hasSymbols && (
+          <span className="memory-module-expand" title={expanded ? 'Collapse symbols' : 'Expand symbols'}>
+            {expanded ? '▲' : '▼'}
+          </span>
+        )}
       </div>
       <div
-        className={`memory-module-purpose${expanded ? ' expanded' : ''}`}
-        onClick={() => setExpanded(v => !v)}
+        className={`memory-module-purpose${!hasSymbols && !hasError ? ' clickable' : ''}`}
+        onClick={() => !hasSymbols && setExpanded(v => !v)}
         title={expanded ? 'Click to collapse' : 'Click to expand'}
       >
         {hasError
@@ -56,7 +96,24 @@ const ModuleCard: React.FC<{ mod: MemoryModule }> = ({ mod }) => {
           {mod.patterns.map(p => <span key={p} className="badge pattern">{p}</span>)}
         </div>
       )}
-      {expanded && mod.key_components.length > 0 && (
+      {expanded && hasSymbols && (
+        <ul className="memory-symbols-list">
+          {mod.symbols!.slice(0, 20).map((sym, i) => (
+            <li
+              key={i}
+              className="memory-symbol-row"
+              onClick={() => handleSymbolClick(sym)}
+              title={`Go to line ${sym.line_start}: ${sym.signature}`}
+            >
+              <span className="symbol-type-icon">{symbolIcon(sym.type)}</span>
+              <span className="symbol-name">{sym.name}</span>
+              <span className="symbol-line">:{sym.line_start}</span>
+              <span className="symbol-sig" title={sym.signature}>{sym.signature.slice(0, 40)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {expanded && !hasSymbols && mod.key_components.length > 0 && (
         <ul className="memory-key-components">
           {mod.key_components.map(c => <li key={c}>{c}</li>)}
         </ul>
@@ -71,10 +128,32 @@ const ModuleCard: React.FC<{ mod: MemoryModule }> = ({ mod }) => {
 const FileMemoryDetail: React.FC<{ mod: MemoryModule }> = ({ mod }) => {
   const hasError = isErrorPurpose(mod.purpose);
   const shortPath = mod.path.length > 50 ? '…' + mod.path.slice(-50) : mod.path;
+  const hasSymbols = (mod.symbols?.length ?? 0) > 0;
+  const usedByCount = mod.imported_by?.length ?? 0;
+
+  const setOpenedFile = useAppStore(s => s.setOpenedFile);
+  const setCenterTab = useAppStore(s => s.setCenterTab);
+  const selectedProject = useAppStore(s => s.selectedProject);
+
+  const handleSymbolClick = (sym: MemorySymbol) => {
+    if (!selectedProject) return;
+    setOpenedFile({ path: mod.path, projectId: selectedProject.id, line: sym.line_start });
+    setCenterTab('file');
+  };
 
   return (
     <div className="file-memory-detail">
-      <div className="file-memory-filename">{mod.name}</div>
+      <div className="file-memory-header-row">
+        <div className="file-memory-filename">{mod.name}</div>
+        {usedByCount > 0 && (
+          <span
+            className={`memory-usedby-badge${usedByCount >= 5 ? ' hot' : ''}`}
+            title={`Used by: ${mod.imported_by!.join(', ')}`}
+          >
+            ↑{usedByCount} users
+          </span>
+        )}
+      </div>
       <div className="file-memory-path" title={mod.path}>{shortPath}</div>
 
       <div className="file-memory-section-label">📌 Purpose</div>
@@ -84,6 +163,34 @@ const FileMemoryDetail: React.FC<{ mod: MemoryModule }> = ({ mod }) => {
           : (mod.purpose || '（無描述）')
         }
       </div>
+
+      {!hasError && mod.edit_hints && (
+        <>
+          <div className="file-memory-section-label">✏️ Edit Hints</div>
+          <div className="file-memory-edit-hints">{mod.edit_hints}</div>
+        </>
+      )}
+
+      {!hasError && hasSymbols && (
+        <>
+          <div className="file-memory-section-label">🔤 Symbols</div>
+          <ul className="memory-symbols-list">
+            {mod.symbols!.slice(0, 20).map((sym, i) => (
+              <li
+                key={i}
+                className="memory-symbol-row"
+                onClick={() => handleSymbolClick(sym)}
+                title={`Go to line ${sym.line_start}: ${sym.signature}`}
+              >
+                <span className="symbol-type-icon">{symbolIcon(sym.type)}</span>
+                <span className="symbol-name">{sym.name}</span>
+                <span className="symbol-line">:{sym.line_start}</span>
+                <span className="symbol-sig" title={sym.signature}>{sym.signature.slice(0, 40)}</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
 
       {!hasError && mod.patterns.length > 0 && (
         <>

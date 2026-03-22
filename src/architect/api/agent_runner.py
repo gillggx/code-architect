@@ -43,6 +43,11 @@ AGENT_MODEL = os.getenv("DEFAULT_LLM_MODEL", "anthropic/claude-sonnet-4-5")
 CHUNK_SIZE = 12  # Max plan steps per execution phase
 APPROVAL_TIMEOUT = 900  # 15 minutes
 MAX_LINT_RETRIES = 3    # self-correction attempts per file
+SUMMARY_THRESHOLD = 20   # messages before summarization kicks in
+ACTIVE_FILE_LOOKBACK = 6  # recent iterations to scan for active files
+MAX_HYDRATED_SYMBOLS = 15 # symbols per hydrated module
+MAX_ITERATIONS = 50      # hard cap per phase — prevents infinite exploration loops
+MAX_STALL_REPEATS = 3    # identical (tool, args) calls before stall warning is injected
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +155,9 @@ class AgentSession:
     escalation_event: asyncio.Event = field(default_factory=asyncio.Event)
     escalation_action: Optional[str] = None   # "alternative" | "manual_fix" | "stop"
     escalation_instruction: Optional[str] = None
+    git_base_branch: Optional[str] = None
+    git_task_branch: Optional[str] = None
+    git_stash_created: bool = False
 
 
 _agent_sessions: Dict[str, AgentSession] = {}
@@ -443,6 +451,11 @@ class AgentRunner:
         self._files_read: set = set()                  # normalized paths read this session
         self._working_memory: Dict[str, str] = {}      # path → key facts snippet
         self._last_tool_was_think: bool = False        # think() called before last write?
+
+        # Git checkpoint (Sprint 3.2)
+        self._git_base_branch: Optional[str] = None
+        self._git_task_branch: Optional[str] = None
+        self._git_checkpoint_created: bool = False
 
         # Lazy-init openai client
         self._oai = None
@@ -936,6 +949,178 @@ Now generate the real plan for the task above. You may include plan_b if there i
             if self._session:
                 self._session.status = "stopped"
 
+    def _get_active_file_context(self, messages: List[Dict]) -> str:
+        """Build focused ## Active Context block for files recently touched by tool calls."""
+        recent = messages[-ACTIVE_FILE_LOOKBACK * 2:]
+        active_stems: set = set()
+        for msg in recent:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls", []):
+                    fn = tc.get("function", {})
+                    if fn.get("name") in ("read_file", "write_file", "edit_file"):
+                        try:
+                            args = json.loads(fn.get("arguments", "{}"))
+                            path = args.get("path", "")
+                            if path:
+                                active_stems.add(Path(path).stem.lower())
+                        except Exception:
+                            pass
+        if not active_stems or not self.project_modules:
+            return ""
+
+        active_modules: List[Dict] = []
+        seen_paths: set = set()
+
+        for mod in self.project_modules:
+            mod_stem = Path(mod.get("path", "")).stem.lower()
+            if mod_stem in active_stems and mod.get("path") not in seen_paths:
+                active_modules.append(mod)
+                seen_paths.add(mod.get("path", ""))
+                # Include first-degree imported_by
+                for dep_stem in mod.get("imported_by", []):
+                    for dep_mod in self.project_modules:
+                        dep_path = dep_mod.get("path", "")
+                        if Path(dep_path).stem.lower() == dep_stem.lower() and dep_path not in seen_paths:
+                            active_modules.append(dep_mod)
+                            seen_paths.add(dep_path)
+                # Include first-degree dependencies
+                for dep_name in mod.get("dependencies", []):
+                    for dep_mod in self.project_modules:
+                        dep_path = dep_mod.get("path", "")
+                        if dep_mod.get("name", "").lower() == dep_name.lower() and dep_path not in seen_paths:
+                            active_modules.append(dep_mod)
+                            seen_paths.add(dep_path)
+
+        if not active_modules:
+            return ""
+
+        lines = ["## Active Context (files recently in play)"]
+        for mod in active_modules[:8]:
+            name = mod.get("name", "unknown")
+            path = mod.get("path", "")
+            purpose = mod.get("purpose", "")
+            edit_hints = mod.get("edit_hints") or mod.get("notes", "")
+            symbols = mod.get("symbols", [])
+            imported_by = mod.get("imported_by", [])
+
+            lines.append(f"\n### {name}  `{path}`")
+            lines.append(f"**Purpose:** {purpose}")
+            if edit_hints and edit_hints.lower() not in ("none", "none.", ""):
+                lines.append(f"**Edit hints:** {edit_hints}")
+            if symbols:
+                lines.append("**Symbols:**")
+                for s in symbols[:MAX_HYDRATED_SYMBOLS]:
+                    lines.append(
+                        f"  - `{s['name']}` line {s['line_start']}–{s['line_end']}: {s['signature']}"
+                    )
+            if imported_by:
+                lines.append(f"**Imported by:** {', '.join(imported_by[:5])}")
+        return "\n".join(lines)
+
+    async def _maybe_summarize(self, messages: List[Dict]) -> List[Dict]:
+        """If messages exceed SUMMARY_THRESHOLD, summarize old turns into a Technical State Summary."""
+        if len(messages) <= SUMMARY_THRESHOLD:
+            return messages
+
+        client = self._get_client()
+        preserve_tail = messages[-4:]
+        to_summarize = messages[1:-4]
+
+        if not to_summarize:
+            return messages
+
+        summary_content = "\n\n".join(
+            f"{m['role'].upper()}: {str(m.get('content', ''))[:500]}"
+            for m in to_summarize
+            if m.get("content")
+        )
+
+        try:
+            resp = await client.chat.completions.create(
+                model=AGENT_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a technical summarizer. Be concise and factual."},
+                    {"role": "user", "content": (
+                        "Summarize this technical session as a Technical State Summary. "
+                        "Include: decisions made, files changed, current state, open problems.\n\n"
+                        + summary_content[:6000]
+                    )},
+                ],
+                max_tokens=800,
+                temperature=0.1,
+            )
+            summary = resp.choices[0].message.content or ""
+        except Exception as exc:
+            logger.warning("Summarization failed: %s", exc)
+            return messages
+
+        logger.info("Summarized %d messages → 1 summary block", len(to_summarize))
+        return [
+            messages[0],  # system prompt
+            {"role": "system", "content": f"## Technical State Summary\n{summary}"},
+            *preserve_tail,
+        ]
+
+    async def _init_git_checkpoint(self) -> None:
+        """Create architect/task-{id} branch as a checkpoint before first mutating tool."""
+        if self._git_checkpoint_created:
+            return
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.project_path, capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                return  # Not a git repo
+
+            branch_result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=self.project_path, capture_output=True, text=True, timeout=5,
+            )
+            base_branch = branch_result.stdout.strip() or "main"
+
+            # Stash dirty working tree before branching (named stash for safe pop later)
+            status_result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=self.project_path, capture_output=True, text=True, timeout=5,
+            )
+            has_changes = bool(status_result.stdout.strip())
+            if has_changes:
+                subprocess.run(
+                    ["git", "stash", "push", "--include-untracked",
+                     "-m", f"Architect pre-task backup {self.session_id[:8]}"],
+                    cwd=self.project_path, capture_output=True, text=True, timeout=10,
+                )
+
+            task_branch = f"architect/task-{self.session_id[:8]}"
+            checkout_result = subprocess.run(
+                ["git", "checkout", "-b", task_branch],
+                cwd=self.project_path, capture_output=True, text=True, timeout=10,
+            )
+
+            if has_changes:
+                subprocess.run(
+                    ["git", "stash", "pop"],
+                    cwd=self.project_path, capture_output=True, text=True, timeout=10,
+                )
+
+            if checkout_result.returncode != 0:
+                logger.warning("Git checkpoint failed: %s", checkout_result.stderr.strip())
+                return
+
+            self._git_base_branch = base_branch
+            self._git_task_branch = task_branch
+            self._git_checkpoint_created = True
+
+            if self._session:
+                self._session.git_base_branch = base_branch
+                self._session.git_task_branch = task_branch
+                self._session.git_stash_created = has_changes
+
+            logger.info("Git checkpoint: created branch %s from %s (stash: %s)", task_branch, base_branch, has_changes)
+        except Exception as exc:
+            logger.warning("Git checkpoint creation failed: %s", exc)
+
     async def _agentic_loop(self) -> AsyncIterator[ToolCallEvent]:
         client = self._get_client()
         system_prompt = self._build_system_prompt()
@@ -964,15 +1149,34 @@ Now generate the real plan for the task above. You may include plan_b if there i
 
         prev_summary = ""
 
+        # Emit one-time task briefing before execution starts (pure string — no LLM call)
+        if plan_a and plan_a.steps:
+            step_lines = "\n".join(
+                f"  {s.index}. {s.description}"
+                + (f"  [{', '.join(s.files_affected[:2])}]" if s.files_affected else "")
+                for s in plan_a.steps
+            )
+            briefing = (
+                f"🚀 Task: {self.task[:120]}\n\n"
+                f"Execution plan — {len(plan_a.steps)} step{'s' if len(plan_a.steps) != 1 else ''}"
+                f" ({int(plan_a.confidence * 100)}% confidence, {plan_a.risk_level} risk):\n"
+                f"{step_lines}\n\n"
+                f"▶ Starting Step 1..."
+            )
+        else:
+            briefing = f"🚀 Starting: {self.task[:120]}"
+        yield ToolCallEvent(type="message", content=briefing)
+
         for chunk_idx, chunk_steps in enumerate(chunks):
             if self._session and self._session.status in ("stopped", "error"):
                 return
 
             if total_chunks > 1:
                 step_range = f"{chunk_steps[0].index}–{chunk_steps[-1].index}" if chunk_steps else "?"
+                phase_desc = chunk_steps[0].description if chunk_steps else ""
                 yield ToolCallEvent(
                     type="message",
-                    content=f"Phase {chunk_idx + 1}/{total_chunks} — steps {step_range}",
+                    content=f"▶ Phase {chunk_idx + 1}/{total_chunks} — steps {step_range}: {phase_desc}",
                 )
 
             # Build task message for this chunk
@@ -1001,25 +1205,44 @@ Now generate the real plan for the task above. You may include plan_b if there i
 
             chunk_completed = False
             iteration = 0
+            _stall_counts: Dict[str, int] = {}  # stall detection: "fn:args_hash" → count
 
             while True:
                 iteration += 1
                 logger.info("Phase %d/%d iteration %d", chunk_idx + 1, total_chunks, iteration)
+
+                if iteration > MAX_ITERATIONS:
+                    yield ToolCallEvent(
+                        type="error",
+                        error=(
+                            f"Phase {chunk_idx + 1} hit the iteration limit ({MAX_ITERATIONS}) "
+                            "without completing. The agent may be stuck in an exploration loop. "
+                            "Stopping to prevent runaway execution."
+                        ),
+                    )
+                    if self._session:
+                        self._session.status = "error"
+                    return
 
                 # Check if session was stopped
                 if self._session and self._session.status == "stopped":
                     yield ToolCallEvent(type="done", content="Stopped by user.", changes=self._changes)
                     return
 
-                # Inject working memory as a fresh system message before each LLM call
+                # Summarize if messages exceed threshold (Sprint 3.1)
+                messages = await self._maybe_summarize(messages)
+
+                # Inject working memory + active context as system messages before LLM call
                 call_messages = list(messages)
+                injections = []
                 if self._working_memory:
                     mem_lines = [f"  - {p}: {s[:150]}" for p, s in self._working_memory.items()]
-                    mem_block = "## Files read this session (key facts):\n" + "\n".join(mem_lines)
-                    # Insert after the first system message
-                    call_messages.insert(1, {"role": "system", "content": mem_block})
-                else:
-                    call_messages = messages
+                    injections.append("## Files read this session (key facts):\n" + "\n".join(mem_lines))
+                active_ctx = self._get_active_file_context(messages)
+                if active_ctx:
+                    injections.append(active_ctx)
+                if injections:
+                    call_messages.insert(1, {"role": "system", "content": "\n\n".join(injections)})
 
                 # Force tool use on first iteration so agent doesn't just output analysis text
                 tc_mode = "required" if iteration == 1 else "auto"
@@ -1077,6 +1300,22 @@ Now generate the real plan for the task above. You may include plan_b if there i
                         fn_args = {}
 
                     yield ToolCallEvent(type="tool_call", tool=fn_name, args=fn_args)
+
+                    # Stall detection: repeated identical (tool, args) calls signal a stuck loop
+                    _stall_key = f"{fn_name}:{hash(tc.function.arguments)}"
+                    _stall_counts[_stall_key] = _stall_counts.get(_stall_key, 0) + 1
+                    if _stall_counts[_stall_key] >= MAX_STALL_REPEATS:
+                        _stall_msg = (
+                            f"STALL DETECTED: '{fn_name}' called with identical arguments "
+                            f"{_stall_counts[_stall_key]} times without making progress. "
+                            "You are stuck in a loop. You MUST either: "
+                            "(1) make a concrete code change using edit_file or write_file, "
+                            "(2) call think() to reassess your approach and try something different, "
+                            "or (3) report that the task cannot be completed and explain why."
+                        )
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": _stall_msg})
+                        yield ToolCallEvent(type="tool_output", tool=fn_name, result=_stall_msg)
+                        continue
 
                     # Validate required args before approval — short-circuit if missing
                     _arg_error: Optional[str] = None
@@ -1139,6 +1378,16 @@ Now generate the real plan for the task above. You may include plan_b if there i
 
                     # For mutating tools in interactive mode: request approval
                     is_mutating = fn_name in ("write_file", "edit_file", "run_command")
+
+                    # Create git checkpoint on first mutating tool (Sprint 3.2)
+                    if self.mode == "interactive" and is_mutating and not self._git_checkpoint_created:
+                        await self._init_git_checkpoint()
+                        if self._git_checkpoint_created:
+                            yield ToolCallEvent(
+                                type="message",
+                                content=f"🔒 Workspace locked — task branch `{self._git_task_branch}` created. Use Rollback to undo all changes.",
+                            )
+
                     if self.mode == "interactive" and is_mutating and self._session and not self.auto_approve:
                         # Compute preview diff for file operations
                         preview_diff = ""
@@ -1225,6 +1474,39 @@ Now generate the real plan for the task above. You may include plan_b if there i
                     if file_change:
                         self._changes.append(file_change)
 
+                    # Architecture lint after successful write/edit (Sprint 4.2)
+                    if (
+                        file_change
+                        and file_change.applied
+                        and fn_name in ("write_file", "edit_file")
+                    ):
+                        try:
+                            from .arch_linter import check_file_violations
+                            arch_violations = check_file_violations(
+                                file_change.file, file_change.content, self.project_path
+                            )
+                            if arch_violations:
+                                enriched_parts = []
+                                for v in arch_violations:
+                                    msg = v.format_message()
+                                    # Auto-fix Prompt: search memory for a suitable alternative (Gemini suggestion)
+                                    if v.kind == "forbidden":
+                                        # Extract the forbidden import path from the violation detail
+                                        import re as _re2
+                                        m = _re2.search(r"import from '?([^'\"]+)'?", v.detail)
+                                        if m:
+                                            alt = self._find_memory_alternative(m.group(1))
+                                            if alt:
+                                                msg += f"\n  Memory suggestion: {alt}"
+                                    enriched_parts.append(msg)
+                                violation_msgs = "\n\n".join(enriched_parts)
+                                tool_result = f"{tool_result}\n\n{violation_msgs}\n\nFix these architecture violations before continuing."
+                                messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
+                                yield ToolCallEvent(type="tool_output", tool=fn_name, result=tool_result)
+                                continue
+                        except Exception as _linter_exc:
+                            logger.debug("Arch linter error (non-fatal): %s", _linter_exc)
+
                     # Auto-lint after successful write/edit
                     if (
                         file_change
@@ -1256,6 +1538,10 @@ Now generate the real plan for the task above. You may include plan_b if there i
                                     f"{lint_msg}. Fix the syntax error before continuing."
                                 )
 
+                    # Sticky Context: update module edit_hints after successful write/edit
+                    if file_change and file_change.applied and fn_name in ("write_file", "edit_file"):
+                        self._update_module_edit_hints(fn_name, fn_args, file_change)
+
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -1268,6 +1554,58 @@ Now generate the real plan for the task above. You may include plan_b if there i
                         diff=file_change.diff if file_change else None,
                     )
 
+
+    def _find_memory_alternative(self, forbidden_import: str) -> Optional[str]:
+        """Search project_modules for a suitable alternative to a forbidden import path.
+
+        For example: forbidden 'src/models/user' → find 'src/services/user_service.py'.
+        Returns a suggestion string or None.
+        """
+        if not self.project_modules:
+            return None
+        # Extract resource keyword from the forbidden path (last path segment, strip wildcards)
+        import re as _re
+        keyword = _re.sub(r'[*\[\]{}]', '', forbidden_import).rstrip("/").split("/")[-1].lower()
+        if len(keyword) < 3:
+            return None
+
+        # Prefer service/handler/facade modules over raw model/db modules
+        preferred_tiers = ("service", "handler", "facade", "controller", "use_case", "usecase", "repository")
+        candidates = []
+        for mod in self.project_modules:
+            mod_name = mod.get("name", "").lower()
+            mod_path = mod.get("path", "").lower()
+            if keyword in mod_name or keyword in mod_path:
+                tier_score = sum(1 for t in preferred_tiers if t in mod_path or t in mod_name)
+                candidates.append((tier_score, mod))
+        if not candidates:
+            return None
+        # Pick highest tier score
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_mod = candidates[0][1]
+        return f"Consider using `{best_mod['path']}` ({best_mod.get('purpose', '')[:80]})"
+
+    def _update_module_edit_hints(self, fn_name: str, fn_args: Dict[str, Any], fc: FileChange) -> None:
+        """Sticky Context (Gemini): after a successful write/edit, patch that module's edit_hints
+        so future active-context hydration reflects the latest mental model."""
+        path_norm = Path(fc.file).as_posix()
+        ts = datetime.now().strftime("%H:%M")
+        if fn_name == "edit_file":
+            old_snippet = (fn_args.get("old_str", "") or "")[:60].replace("\n", "↵")
+            new_snippet = (fn_args.get("new_str", "") or "")[:60].replace("\n", "↵")
+            note = f"[{ts}] edited: «{old_snippet}» → «{new_snippet}»"
+        else:
+            note = f"[{ts}] write_file: {len(fc.content)} chars"
+
+        for mod in self.project_modules:
+            mod_path = mod.get("path", "")
+            if mod_path == path_norm or mod_path.endswith(path_norm) or path_norm.endswith(mod_path):
+                existing = (mod.get("edit_hints") or "").strip()
+                # Prepend newest note; keep total under 400 chars
+                updated = f"{note}\n{existing}" if existing else note
+                mod["edit_hints"] = updated[:400]
+                logger.debug("Sticky context updated edit_hints for %s", mod_path)
+                break
 
     def _compute_preview_diff(self, fn_name: str, fn_args: Dict[str, Any]) -> str:
         """Compute a preview diff for write_file / edit_file without writing to disk."""
@@ -1399,6 +1737,12 @@ Now generate the real plan for the task above. You may include plan_b if there i
                     return "Error: edit_file requires a 'path' argument — please specify the file path.", None
                 if not old_str:
                     return "Error: edit_file requires an 'old_str' argument — the exact string to replace.", None
+                if old_str == new_str:
+                    return (
+                        "Error: old_str and new_str are identical — no change would be made. "
+                        "Revise your edit so the new content is actually different from the original.",
+                        None,
+                    )
 
                 from .tools.file_tools import _resolve
                 resolved = _resolve(path, pp)

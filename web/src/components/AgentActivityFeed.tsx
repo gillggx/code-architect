@@ -176,6 +176,25 @@ const ApprovalCard: React.FC<{ event: AgentEvent }> = ({ event }) => {
 };
 
 // ---------------------------------------------------------------------------
+// Briefing message card (🚀 task start + step list)
+// ---------------------------------------------------------------------------
+const BriefingMessage: React.FC<{ content: string }> = ({ content }) => {
+  const parts = content.split('\n\n');
+  const header = parts[0] ?? '';
+  const body = parts.slice(1).join('\n\n');
+  return (
+    <div className="briefing-message">
+      <div className="briefing-header">{header}</div>
+      {body && <pre className="briefing-body">{body}</pre>}
+    </div>
+  );
+};
+
+function isBriefingMessage(content: string): boolean {
+  return content.startsWith('🚀');
+}
+
+// ---------------------------------------------------------------------------
 // Activity event row
 // ---------------------------------------------------------------------------
 const EventRow: React.FC<{ event: AgentEvent }> = ({ event }) => {
@@ -265,6 +284,16 @@ const EventRow: React.FC<{ event: AgentEvent }> = ({ event }) => {
   }
 
   // Default row (all other event types including analysis events)
+  // Briefing messages get special card rendering
+  if (event.type === 'message' && event.content && isBriefingMessage(event.content)) {
+    return (
+      <div className="event-row event-row-message">
+        <span className="event-time">{fmtTime(event.timestamp)}</span>
+        <BriefingMessage content={event.content} />
+      </div>
+    );
+  }
+
   let displayMsg = event.message;
   if (event.type === 'llm_start' && event.file) displayMsg = `Reading ${event.file}…`;
   if (event.type === 'llm_done' && event.file) {
@@ -321,8 +350,37 @@ const AgentActivityFeed: React.FC = () => {
   const setOpenedFile = useAppStore(s => s.setOpenedFile);
   const editMode = useAppStore(s => s.editMode);
 
+  // Active step bar — tracks latest progress marker from the agent
+  const [activeStep, setActiveStep] = useState<string | null>(null);
+
   const activityBottomRef = useRef<HTMLDivElement>(null);
   const chatBottomRef = useRef<HTMLDivElement>(null);
+
+  // Update active step from agent message events
+  useEffect(() => {
+    const lastMessages = events.filter(e => e.type === 'message' && e.content);
+    for (let i = lastMessages.length - 1; i >= 0; i--) {
+      const content = lastMessages[i].content ?? '';
+      // Match briefing "▶ Starting Step N...", phase markers "▶ Phase N/M", or step announcements
+      if (content.includes('▶')) {
+        const match = content.match(/▶\s*(.{0,80})/);
+        if (match) {
+          setActiveStep(match[1].trim());
+          break;
+        }
+      }
+      // Reset on done
+      if (lastMessages[i].type === 'done') {
+        setActiveStep(null);
+        break;
+      }
+    }
+    // Clear on done events
+    const lastEvent = events[events.length - 1];
+    if (lastEvent?.type === 'done' || lastEvent?.type === 'error') {
+      setActiveStep(null);
+    }
+  }, [events.length]);
 
   // Auto-scroll activity feed
   useEffect(() => {
@@ -412,14 +470,22 @@ const AgentActivityFeed: React.FC = () => {
             <div className="empty-state-text">Analyze a project to see the agent at work</div>
           </div>
         ) : (
-          <div className="event-feed">
-            {events
-              .filter(e => e.type !== 'pattern' && e.type !== 'session')
-              .map(e => (
-                <EventRow key={e.id} event={e} />
-              ))}
-            <div ref={activityBottomRef} />
-          </div>
+          <>
+            {activeStep && (
+              <div className="activity-active-step-bar">
+                <span className="activity-active-step-icon">▶</span>
+                <span className="activity-active-step-text">{activeStep}</span>
+              </div>
+            )}
+            <div className="event-feed">
+              {events
+                .filter(e => e.type !== 'pattern' && e.type !== 'session')
+                .map(e => (
+                  <EventRow key={e.id} event={e} />
+                ))}
+              <div ref={activityBottomRef} />
+            </div>
+          </>
         )
       )}
 

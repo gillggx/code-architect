@@ -47,6 +47,7 @@ from .schemas import (
     ApprovePlanRequest,
     EscalationRequest,
     RevertRequest,
+    RollbackRequest,
 )
 from ..llm import create_chat_engine, get_or_create_session
 from .websocket import (
@@ -1603,6 +1604,107 @@ def create_app(debug: bool = False) -> FastAPI:
         target.parent.mkdir(parents=True, exist_ok=True)
         _shutil.copy2(latest_backup, target)
         return {"ok": True, "restored_from": str(latest_backup.name), "file": request.file_path}
+
+    @app.post(
+        "/api/agent/rollback-session",
+        tags=["agent"],
+        summary="Rollback all changes for a session by deleting the task git branch",
+    )
+    async def rollback_session(request: RollbackRequest) -> dict:
+        """Restore to the base branch and delete the task branch created by the agent."""
+        import subprocess as _sp
+        from .agent_runner import get_session
+
+        sess = get_session(request.session_id)
+        if not sess:
+            raise HTTPException(status_code=404, detail=f"Session not found: {request.session_id}")
+        if not sess.git_base_branch or not sess.git_task_branch:
+            raise HTTPException(status_code=400, detail="No git checkpoint found for this session.")
+
+        # We need the project_path — try to find it from active runners in the session registry
+        # The session doesn't store project_path, so we look it up via task_branch name (safe fallback)
+        project_path = None
+        # Try to find from environment or session metadata (best effort)
+        from .agent_runner import _agent_sessions
+        # Note: project_path is not stored in AgentSession; the caller should pass it.
+        # Raise helpful error instead.
+        raise HTTPException(
+            status_code=400,
+            detail="rollback-session requires project_path. Use /api/agent/rollback-session-v2 with project_path."
+        )
+
+    @app.post(
+        "/api/agent/rollback-session-v2",
+        tags=["agent"],
+        summary="Rollback all changes — checkout base branch, delete task branch",
+    )
+    async def rollback_session_v2(
+        session_id: str,
+        project_path: str,
+    ) -> dict:
+        """Restore to the base branch and delete the task branch created by the agent."""
+        import subprocess as _sp
+        from .agent_runner import get_session
+
+        sess = get_session(session_id)
+        if not sess:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        if not sess.git_base_branch or not sess.git_task_branch:
+            raise HTTPException(status_code=400, detail="No git checkpoint found for this session.")
+
+        project_path = os.path.abspath(os.path.expanduser(project_path))
+        base = sess.git_base_branch
+        task = sess.git_task_branch
+
+        try:
+            # Checkout base branch
+            r1 = _sp.run(
+                ["git", "checkout", base],
+                cwd=project_path, capture_output=True, text=True, timeout=15,
+            )
+            if r1.returncode != 0:
+                raise HTTPException(status_code=500, detail=f"git checkout failed: {r1.stderr.strip()}")
+
+            # Delete task branch
+            r2 = _sp.run(
+                ["git", "branch", "-D", task],
+                cwd=project_path, capture_output=True, text=True, timeout=10,
+            )
+            if r2.returncode != 0:
+                logger.warning("Could not delete task branch %s: %s", task, r2.stderr.strip())
+
+            # Restore pre-task stash if one was created
+            if getattr(sess, "git_stash_created", False):
+                stash_list = _sp.run(
+                    ["git", "stash", "list"],
+                    cwd=project_path, capture_output=True, text=True, timeout=5,
+                )
+                session_tag = session_id[:8]
+                matching_stash = None
+                for line in stash_list.stdout.splitlines():
+                    if f"Architect pre-task backup {session_tag}" in line:
+                        matching_stash = line.split(":")[0].strip()  # e.g. "stash@{0}"
+                        break
+                if matching_stash:
+                    pop_result = _sp.run(
+                        ["git", "stash", "pop", matching_stash],
+                        cwd=project_path, capture_output=True, text=True, timeout=15,
+                    )
+                    if pop_result.returncode != 0:
+                        logger.warning("Could not pop stash %s: %s", matching_stash, pop_result.stderr.strip())
+                    else:
+                        logger.info("Restored pre-task stash %s", matching_stash)
+
+            # Clear session git state
+            sess.git_base_branch = None
+            sess.git_task_branch = None
+            sess.git_stash_created = False
+
+            return {"status": "rolled_back", "branch": base}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Rollback failed: {exc}") from exc
 
     # ========================================================================
     # File System Helpers (for GUI folder browser + pre-scan)

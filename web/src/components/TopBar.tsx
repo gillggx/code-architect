@@ -116,6 +116,8 @@ const TopBar: React.FC = () => {
 
   const freshnessStatus = useAppStore((s) => s.freshnessStatus);
   const setFreshnessStatus = useAppStore((s) => s.setFreshnessStatus);
+  const agentSession = useAppStore((s) => s.agentSession);
+  const setAgentSession = useAppStore((s) => s.setAgentSession);
 
   const [showModal, setShowModal] = useState(false);
   const [showBrowser, setShowBrowser] = useState(false);
@@ -187,6 +189,9 @@ const TopBar: React.FC = () => {
           purpose: (d.purpose as string) ?? event.summary ?? '',
           patterns: Array.isArray(d.patterns) ? (d.patterns as string[]) : [],
           key_components: Array.isArray(d.key_components) ? (d.key_components as string[]) : [],
+          symbols: Array.isArray(d.symbols) ? (d.symbols as any[]) : undefined,
+          edit_hints: (d.edit_hints as string) || undefined,
+          imported_by: Array.isArray(d.imported_by) ? (d.imported_by as string[]) : undefined,
         };
         addModule(mod);
       }
@@ -223,6 +228,9 @@ const TopBar: React.FC = () => {
                   purpose: (m.purpose as string) || '',
                   patterns: Array.isArray(m.patterns) ? (m.patterns as string[]) : [],
                   key_components: Array.isArray(m.key_components) ? (m.key_components as string[]) : [],
+                  symbols: Array.isArray(m.symbols) ? (m.symbols as any[]) : undefined,
+                  edit_hints: (m.edit_hints as string) || undefined,
+                  imported_by: Array.isArray(m.imported_by) ? (m.imported_by as string[]) : undefined,
                 });
               }
             }
@@ -376,6 +384,27 @@ const TopBar: React.FC = () => {
     }
   };
 
+  const handleRollback = async () => {
+    if (!agentSession || !selectedProject) return;
+    if (!window.confirm('Roll back all agent changes and return to base branch?')) return;
+    try {
+      const res = await fetch(
+        `/api/agent/rollback-session-v2?session_id=${encodeURIComponent(agentSession)}&project_path=${encodeURIComponent(selectedProject.path)}`,
+        { method: 'POST' }
+      );
+      if (res.ok) {
+        setAgentSession(null);
+        clearEvents();
+        addEvent({ id: crypto.randomUUID(), type: 'message' as any, message: 'Rolled back to base branch.', timestamp: new Date() });
+      } else {
+        const body = await res.json().catch(() => ({})) as { detail?: string };
+        addEvent({ id: crypto.randomUUID(), type: 'error', message: `Rollback failed: ${body.detail ?? res.status}`, timestamp: new Date() });
+      }
+    } catch (err) {
+      addEvent({ id: crypto.randomUUID(), type: 'error', message: `Rollback error: ${(err as Error).message}`, timestamp: new Date() });
+    }
+  };
+
   const handleRefresh = async () => {
     if (!selectedProject) return;
     setIsSubmitting(true);
@@ -504,6 +533,15 @@ const TopBar: React.FC = () => {
           )}
           {!isRunning && freshnessStatus && !freshnessStatus.isStale && appView === 'workspace' && (
             <span className="topbar-freshness-fresh" title="所有追蹤檔案均為最新">✅ 最新</span>
+          )}
+          {appView === 'workspace' && agentSession && (
+            <button
+              className="topbar-btn topbar-rollback-btn"
+              onClick={handleRollback}
+              title="Roll back all agent changes (git checkout base branch)"
+            >
+              🔄 Rollback
+            </button>
           )}
           {appView === 'workspace' && selectedProject && (
             <button

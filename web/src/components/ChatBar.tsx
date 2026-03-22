@@ -8,6 +8,53 @@
 import React, { useState, useRef } from 'react';
 import { useChat, useUI, useJob, useAppStore } from '../store/app';
 
+// ---------------------------------------------------------------------------
+// Impact Preview Modal (Sprint 4.1)
+// ---------------------------------------------------------------------------
+interface ImpactFile {
+  path: string;
+  confidence: number;
+  reason: string;
+}
+
+interface ImpactPreviewModalProps {
+  files: ImpactFile[];
+  loading: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}
+
+const ImpactPreviewModal: React.FC<ImpactPreviewModalProps> = ({ files, loading, onConfirm, onCancel }) => (
+  <div className="modal-backdrop" onClick={onCancel}>
+    <div className="modal" onClick={e => e.stopPropagation()}>
+      <h2>Predicted Impact</h2>
+      {loading ? (
+        <div className="impact-loading">Analyzing impact…</div>
+      ) : files.length === 0 ? (
+        <div className="impact-empty">No predicted file changes found.</div>
+      ) : (
+        <div className="impact-list">
+          {files.map((f, i) => (
+            <div key={i} className="impact-row">
+              <div className="impact-confidence-track">
+                <div className="impact-confidence-bar" style={{ width: `${Math.round(f.confidence * 100)}%` }} />
+              </div>
+              <span className="impact-path" title={f.path}>{f.path}</span>
+              <span className="impact-badge">{f.reason}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="modal-actions">
+        <button className="modal-btn" onClick={onCancel}>Cancel</button>
+        <button className="modal-btn primary" onClick={onConfirm} disabled={loading}>
+          Confirm &amp; Run
+        </button>
+      </div>
+    </div>
+  </div>
+);
+
 const ChatBar: React.FC = () => {
   const { addChatMessage, updateLastAssistantMessage, isChatStreaming, setChatStreaming, chatMessages } = useChat();
   const { selectedProject } = useUI();
@@ -31,6 +78,12 @@ const ChatBar: React.FC = () => {
   const abortRef = useRef<AbortController | null>(null);
   const sessionIdRef = useRef<string>(crypto.randomUUID());
   const [isAgentRunning, setIsAgentRunning] = useState(false);
+
+  // Impact preview state (Sprint 4.1)
+  const [showImpactModal, setShowImpactModal] = useState(false);
+  const [impactLoading, setImpactLoading] = useState(false);
+  const [impactFiles, setImpactFiles] = useState<ImpactFile[]>([]);
+  const pendingTaskRef = useRef<string>('');
 
   const projectName = selectedProject
     ? selectedProject.path.split('/').filter(Boolean).pop() ?? selectedProject.path
@@ -102,22 +155,56 @@ const ChatBar: React.FC = () => {
   };
 
   // ------------------------------------------------------------------
-  // Edit agent send
+  // Edit agent send — shows impact preview first (Sprint 4.1)
   // ------------------------------------------------------------------
   const handleEditSend = async () => {
     const text = inputValue.trim();
     if (!text || isAgentRunning) return;
     if (!selectedProject) {
-      addEvent({
-        id: crypto.randomUUID(),
-        type: 'error',
-        message: 'No project selected. Analyze a project first.',
-        timestamp: new Date(),
-      });
+      addEvent({ id: crypto.randomUUID(), type: 'error', message: 'No project selected. Analyze a project first.', timestamp: new Date() });
       return;
     }
-
     setInputValue('');
+    pendingTaskRef.current = text;
+
+    // Call impact API and show preview modal
+    setImpactLoading(true);
+    setImpactFiles([]);
+    setShowImpactModal(true);
+    try {
+      const res = await fetch('/api/a2a/impact', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: selectedProject.id, files: [], change_description: text }),
+      });
+      if (res.ok) {
+        const data = await res.json() as { affected_files?: ImpactFile[] };
+        setImpactFiles(data.affected_files ?? []);
+      }
+      // On error: stay in modal with empty list, user can still confirm
+    } catch {
+      // Network error — keep modal open, allow proceeding
+    } finally {
+      setImpactLoading(false);
+    }
+  };
+
+  const handleImpactConfirm = () => {
+    setShowImpactModal(false);
+    const task = pendingTaskRef.current;
+    if (task) runEditAgent(task);
+  };
+
+  const handleImpactCancel = () => {
+    setShowImpactModal(false);
+    setImpactFiles([]);
+  };
+
+  // ------------------------------------------------------------------
+  // Actual agent execution (after impact confirmed)
+  // ------------------------------------------------------------------
+  const runEditAgent = async (text: string) => {
+    if (!selectedProject) return;
     setCenterTab('activity');
     setIsAgentRunning(true);
 
@@ -296,6 +383,15 @@ const ChatBar: React.FC = () => {
   const isBusy = editMode ? isAgentRunning : isChatStreaming;
 
   return (
+    <>
+    {showImpactModal && (
+      <ImpactPreviewModal
+        files={impactFiles}
+        loading={impactLoading}
+        onConfirm={handleImpactConfirm}
+        onCancel={handleImpactCancel}
+      />
+    )}
     <div className="chatbar">
       {/* Mode toggle */}
       <div className="chatbar-mode-toggle">
@@ -367,6 +463,7 @@ const ChatBar: React.FC = () => {
         </button>
       )}
     </div>
+    </>
   );
 };
 

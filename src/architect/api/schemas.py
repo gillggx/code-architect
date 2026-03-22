@@ -653,3 +653,7 @@ class EscalationRequest(BaseModel):
 class RevertRequest(BaseModel):
     project_path: str   # absolute project root
     file_path: str      # relative path within project to restore
+
+
+class RollbackRequest(BaseModel):
+    session_id: str
