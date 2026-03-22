@@ -657,3 +657,100 @@ class RevertRequest(BaseModel):
 
 class RollbackRequest(BaseModel):
     session_id: str
+
+
+# ============================================================================
+# A2A — New Project Scaffold
+# ============================================================================
+
+class ScaffoldOptions(BaseModel):
+    git_init: bool = Field(True, description="Run git init after scaffolding")
+    auto_analyze: bool = Field(
+        True,
+        description="Trigger project analysis immediately after scaffold completes",
+    )
+
+
+class ScaffoldRequest(BaseModel):
+    """Request to scaffold a new project from a template.
+
+    Attributes:
+        project_path: Absolute path where the new project should be created.
+        template: Project template — fastapi-minimal | fastapi-full | python-lib | agent.
+        project_name: Human-readable name (defaults to directory basename).
+        options: Git + auto-analysis options.
+    """
+    project_path: str = Field(description="Absolute path for the new project", min_length=1)
+    template: str = Field(
+        "fastapi-minimal",
+        description="Template: fastapi-minimal | fastapi-full | python-lib | agent",
+    )
+    project_name: Optional[str] = Field(None, description="Project name (defaults to dir basename)")
+    options: ScaffoldOptions = Field(default_factory=ScaffoldOptions)
+
+
+class ScaffoldResponse(BaseModel):
+    """Result of a scaffold operation.
+
+    Attributes:
+        project_id: Stable project ID derived from the path (usable in /api/a2a/* calls).
+        project_path: Resolved absolute path.
+        template_used: Which template was applied.
+        files_created: Relative paths of all files written.
+        git_initialized: Whether git init + initial commit succeeded.
+        analysis_job_id: Job ID if auto_analyze=true, null otherwise.
+    """
+    project_id: str = Field(description="Project ID for subsequent A2A calls")
+    project_path: str = Field(description="Resolved absolute project path")
+    template_used: str = Field(description="Template that was applied")
+    files_created: List[str] = Field(default_factory=list, description="Files written to disk")
+    git_initialized: bool = Field(False, description="git init succeeded")
+    analysis_job_id: Optional[str] = Field(None, description="Background analysis job ID")
+
+
+# ============================================================================
+# A2A — Component Code Generation
+# ============================================================================
+
+class CodegenRequest(BaseModel):
+    """Request to generate a code component and write it into a project.
+
+    Attributes:
+        project_id: Target project (must already exist on disk).
+        template_type: Code template — pydantic | fastapi | agent | async.
+        template_name: Name for the generated entity (e.g. "UserProfile").
+        context: Template-specific parameters (fields, endpoints, etc.).
+        output_path: Where to write the file (relative to project root).
+                     Auto-inferred from template_type + name if omitted.
+        write_to_disk: Write the generated file to the project (default true).
+    """
+    project_id: str = Field(description="Target project ID")
+    template_type: str = Field(
+        description="Template type: pydantic | fastapi | agent | async",
+    )
+    template_name: str = Field(description="Name of the generated entity", min_length=1)
+    context: Dict[str, Any] = Field(default_factory=dict, description="Template parameters")
+    output_path: Optional[str] = Field(
+        None,
+        description="Output file path relative to project root (auto-inferred if omitted)",
+    )
+    write_to_disk: bool = Field(True, description="Write file to project directory")
+
+
+class CodegenResponse(BaseModel):
+    """Result of a code generation request.
+
+    Attributes:
+        success: Generation succeeded with no blocking errors.
+        code: Generated source code.
+        output_path: Where the file was (or would be) written.
+        validation: Syntax/type/import validation result.
+        errors: Blocking errors that prevented generation.
+        warnings: Non-blocking warnings.
+    """
+    success: bool = Field(description="Generation succeeded")
+    code: str = Field("", description="Generated source code")
+    output_path: Optional[str] = Field(None, description="Written file path (relative)")
+    validation: Dict[str, Any] = Field(default_factory=dict, description="Validation summary")
+    errors: List[str] = Field(default_factory=list, description="Blocking errors")
+    warnings: List[str] = Field(default_factory=list, description="Warnings")

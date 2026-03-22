@@ -43,6 +43,8 @@ from .schemas import (
     GenerateRequest, GenerateResponse, FileChangeSchema,
     ValidateRequest, ValidateResponse,
     ImpactRequest, ImpactResponse,
+    ScaffoldRequest, ScaffoldResponse,
+    CodegenRequest, CodegenResponse,
     ApproveRequest,
     ApprovePlanRequest,
     EscalationRequest,
@@ -1483,6 +1485,178 @@ def create_app(debug: bool = False) -> FastAPI:
             risk="low",
             confidence=0.5,
             recommendation=answer[:500] if answer else "No recommendation available.",
+        )
+
+    @app.post(
+        "/api/a2a/scaffold",
+        response_model=ScaffoldResponse,
+        tags=["a2a"],
+        summary="Scaffold a new project from a template",
+    )
+    async def scaffold_project(request: ScaffoldRequest) -> ScaffoldResponse:
+        """
+        Create a new project directory from a template and optionally trigger analysis.
+
+        Templates:
+          fastapi-minimal — main.py, requirements.txt, README, .gitignore, SOUL.md
+          fastapi-full    — above + routers/ models/ services/ tests/
+          python-lib      — src layout + pyproject.toml + tests/
+          agent           — FastAPI + agent lifecycle skeleton
+        """
+        from .scaffold import create_project, VALID_TEMPLATES
+
+        if request.template not in VALID_TEMPLATES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid template '{request.template}'. Valid: {', '.join(VALID_TEMPLATES)}",
+            )
+
+        try:
+            result = create_project(
+                project_path=request.project_path,
+                template=request.template,
+                project_name=request.project_name,
+                git_init=request.options.git_init,
+            )
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except Exception as exc:
+            logger.error("Scaffold failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Scaffold failed: {exc}")
+
+        analysis_job_id: Optional[str] = None
+
+        if request.options.auto_analyze:
+            try:
+                # Kick off background analysis using the same pipeline as /api/analyze
+                job_id = str(uuid4())
+                memory_dir = os.path.join("architect_memory", result.project_id)
+                os.makedirs(memory_dir, exist_ok=True)
+                with open(os.path.join(memory_dir, "project_path.txt"), "w") as _pf:
+                    _pf.write(result.project_path)
+
+                _app_state.active_jobs[job_id] = {
+                    "status": "running",
+                    "project_id": result.project_id,
+                    "project_path": result.project_path,
+                }
+
+                async def _run_analysis(job_id: str, project_path: str, project_id: str) -> None:
+                    try:
+                        analyzer = create_llm_analyzer()
+                        summary = await analyzer.analyze_project(project_path, project_id=project_id)
+                        _app_state.active_jobs[job_id]["status"] = "complete"
+                        _app_state.active_jobs[job_id]["summary"] = summary
+                    except Exception as _exc:
+                        logger.error("Auto-analysis failed for scaffold job %s: %s", job_id, _exc)
+                        _app_state.active_jobs[job_id]["status"] = "error"
+
+                asyncio.create_task(_run_analysis(job_id, result.project_path, result.project_id))
+                analysis_job_id = job_id
+            except Exception as exc:
+                logger.warning("Could not start auto-analysis after scaffold: %s", exc)
+
+        return ScaffoldResponse(
+            project_id=result.project_id,
+            project_path=result.project_path,
+            template_used=result.template,
+            files_created=result.files_created,
+            git_initialized=result.git_initialized,
+            analysis_job_id=analysis_job_id,
+        )
+
+    @app.post(
+        "/api/a2a/codegen",
+        response_model=CodegenResponse,
+        tags=["a2a"],
+        summary="Generate a code component and write it into a project",
+    )
+    async def codegen_component(request: CodegenRequest) -> CodegenResponse:
+        """
+        Use the codegen template engine to generate a Pydantic model, FastAPI router,
+        agent skeleton, or async pattern, and optionally write it to the project.
+
+        template_type values: pydantic | fastapi | agent | async
+        """
+        from ..codegen import A2ACodegenAdapter, GenerateRequest as CgGenerateRequest
+        from pathlib import Path as _Path
+
+        valid_types = ("pydantic", "fastapi", "agent", "async")
+        if request.template_type not in valid_types:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid template_type '{request.template_type}'. Valid: {', '.join(valid_types)}",
+            )
+
+        # Resolve project path from memory
+        project_path: Optional[str] = None
+        memory_dir = os.path.join("architect_memory", request.project_id)
+        path_file = os.path.join(memory_dir, "project_path.txt")
+        if os.path.isfile(path_file):
+            with open(path_file) as _f:
+                project_path = _f.read().strip()
+        if not project_path or not os.path.isdir(project_path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Project '{request.project_id}' not found. Scaffold or analyze it first.",
+            )
+
+        # Auto-infer output path if not provided
+        output_path = request.output_path
+        if not output_path:
+            type_dirs = {
+                "pydantic": "models",
+                "fastapi": "routers",
+                "agent": "agents",
+                "async": "tasks",
+            }
+            safe_name = request.template_name.lower().replace(" ", "_")
+            output_path = f"{type_dirs[request.template_type]}/{safe_name}.py"
+
+        # Run codegen adapter
+        adapter = A2ACodegenAdapter()
+        cg_request = CgGenerateRequest(
+            request_id=str(uuid4()),
+            template_type=request.template_type,
+            template_name=request.template_name,
+            context=request.context,
+        )
+
+        try:
+            cg_response = await adapter.handle_generate_request(cg_request)
+        except Exception as exc:
+            logger.error("Codegen failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Code generation failed: {exc}")
+
+        if not cg_response.success:
+            return CodegenResponse(
+                success=False,
+                errors=cg_response.errors,
+                warnings=cg_response.warnings,
+            )
+
+        # Write to disk if requested
+        if request.write_to_disk and cg_response.code:
+            try:
+                target = _Path(project_path) / output_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(cg_response.code, encoding="utf-8")
+            except Exception as exc:
+                return CodegenResponse(
+                    success=False,
+                    code=cg_response.code,
+                    output_path=output_path,
+                    errors=[f"Failed to write file: {exc}"],
+                    warnings=cg_response.warnings or [],
+                )
+
+        return CodegenResponse(
+            success=True,
+            code=cg_response.code,
+            output_path=output_path if request.write_to_disk else None,
+            validation=cg_response.metadata or {},
+            errors=cg_response.errors or [],
+            warnings=cg_response.warnings or [],
         )
 
     @app.post(
