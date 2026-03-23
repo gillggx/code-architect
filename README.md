@@ -51,7 +51,10 @@ An AI-powered codebase analysis and agentic coding tool. Point it at any project
 - **Code generation** — `POST /api/a2a/generate` — SSE stream of agent events
 - **Validation** — `POST /api/a2a/validate`
 - **Impact analysis** — `POST /api/a2a/impact` — predicts which files a change will affect
+- **Scaffold** — `POST /api/a2a/scaffold` — create a new project from template with optional auto-analysis
+- **Codegen** — `POST /api/a2a/codegen` — generate Pydantic/FastAPI/agent components and write to disk
 - **Rollback** — `POST /api/agent/rollback-session-v2` — restores workspace to pre-task state
+- **Empty-memory guard** — `POST /api/a2a/generate` returns `HTTP 428` with remediation steps if project has no architecture memory; set `force_generate: true` to bypass
 
 ---
 
@@ -59,8 +62,8 @@ An AI-powered codebase analysis and agentic coding tool. Point it at any project
 
 | Service | Port |
 |---------|------|
-| Backend (FastAPI) | **8001** |
-| Frontend (Vite/React) | **3001** |
+| Backend (FastAPI) | **8765** |
+| Frontend (Vite/React) | **3011** |
 
 Designed to run alongside [agent-platform](https://github.com/gillggx/agent-platform) (ports 8080/2999) on the same machine without conflicts.
 
@@ -185,10 +188,12 @@ You are a careful, security-focused architect.
 
 ## A2A Integration
 
-Other agents (e.g. agent-platform architect agents) can query this service:
+Base URL: `http://127.0.0.1:8765`
+
+### Scenario A — Query an existing project
 
 ```bash
-curl -X POST http://localhost:8001/api/a2a/query \
+curl -X POST http://localhost:8765/api/a2a/query \
   -H "Content-Type: application/json" \
   -d '{"question": "How does authentication work?", "project_id": "my-project", "query_type": "architecture"}'
 ```
@@ -204,19 +209,64 @@ Response:
 }
 ```
 
-The edit agent also accepts `chat_history` for context:
+### Scenario B — Edit an existing project
+
+The edit agent accepts `chat_history` for context and requires memory to exist first:
 
 ```json
 {
   "task": "Add error handling to the login flow",
   "project_id": "my-project",
-  "mode": "interactive",
+  "mode": "apply",
   "chat_history": [
     {"role": "user", "content": "The login flow crashes on invalid tokens"},
     {"role": "assistant", "content": "I can see the issue in auth/jwt.py..."}
   ]
 }
 ```
+
+If the project has no architecture memory, `POST /api/a2a/generate` returns **HTTP 428** with remediation steps:
+
+```json
+{
+  "error": "project_memory_empty",
+  "message": "Project has no architecture memory...",
+  "remediation": {
+    "step_1": { "description": "Trigger analysis", "method": "POST", "path": "/api/analyze" },
+    "step_2": { "description": "Poll for completion", "method": "GET", "path": "/api/projects/{id}/freshness" },
+    "step_3": { "description": "Retry generate", "method": "POST", "path": "/api/a2a/generate" }
+  },
+  "tip": "Set force_generate=true to bypass if task has explicit implementation details."
+}
+```
+
+### Scenario C — Create a new project from scratch
+
+```bash
+# 1. Scaffold the project
+curl -X POST http://localhost:8765/api/a2a/scaffold \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_path": "/path/to/my-service",
+    "template": "fastapi-full",
+    "project_name": "my-service",
+    "options": {"git_init": true, "auto_analyze": true}
+  }'
+
+# 2. Wait for analysis (poll freshness)
+curl http://localhost:8765/api/projects/{project_id}/freshness
+
+# 3. Generate code (now memory exists)
+curl -X POST http://localhost:8765/api/a2a/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "Implement POST /items with validation and persistence",
+    "project_id": "{project_id}",
+    "mode": "apply"
+  }'
+```
+
+Available templates: `fastapi-minimal`, `fastapi-full`, `python-lib`, `agent`
 
 ---
 
@@ -225,8 +275,8 @@ The edit agent also accepts `chat_history` for context:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENROUTER_API_KEY` | — | Required for cloud LLMs |
-| `DEFAULT_LLM_MODEL` | `anthropic/claude-haiku-4-5` | Model for analysis, chat, and edit agent |
+| `DEFAULT_LLM_MODEL` | `google/gemini-2.5-flash-lite` | Model for chat and edit agent |
+| `ANALYSIS_LLM_MODEL` | `google/gemini-2.0-flash-lite-001` | Model for bulk file analysis (cheaper) |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter endpoint |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama fallback |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama fallback (used only if no API key) |
 | `AGENT_SHELL_UNRESTRICTED` | `false` | Bypass shell command allowlist (dev only) |
-| `DEFAULT_LLM_MODEL` | `anthropic/claude-sonnet-4-5` | Model for analysis, chat, and edit agent |
