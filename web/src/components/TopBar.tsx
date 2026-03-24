@@ -3,6 +3,7 @@
  */
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Folder, ArrowLeft, Wrench as BuildIcon, CheckCircle, Zap, RotateCcw, Sun, Moon } from 'lucide-react';
 import {
   useAppStore,
   AgentEvent,
@@ -52,7 +53,7 @@ const FolderBrowser: React.FC<{
     <div className="folder-browser">
       <div className="folder-browser-path">
         {parent && (
-          <button className="folder-browser-up" onClick={() => navigate(parent)}>← Up</button>
+          <button className="folder-browser-up" onClick={() => navigate(parent)}><ArrowLeft size={12} style={{ marginRight: 3 }} />Up</button>
         )}
         <span className="folder-browser-current" title={currentPath}>
           {currentPath}
@@ -66,7 +67,7 @@ const FolderBrowser: React.FC<{
               className="folder-browser-nav"
               onClick={() => navigate(e.path)}
             >
-              📁 {e.name}
+              <Folder size={12} style={{ marginRight: 4 }} />{e.name}
             </button>
             <button
               className="folder-browser-select"
@@ -243,7 +244,7 @@ const TopBar: React.FC = () => {
         addChatMessage({
           id: crypto.randomUUID(),
           role: 'assistant',
-          content: `✅ **Analysis complete** — ${projectName}\n${filesAnalyzed} files analyzed · ${patternsFound} patterns detected · ${duration.toFixed(1)}s\n\nAsk me anything about the architecture.`,
+          content: `**Analysis complete** — ${projectName}\n${filesAnalyzed} files analyzed · ${patternsFound} patterns detected · ${duration.toFixed(1)}s\n\nAsk me anything about the architecture.`,
         });
         const autoPrompt = `Summarize the key architectural findings from this analysis in 3-5 bullet points.`;
         addChatMessage({ id: crypto.randomUUID(), role: 'user', content: autoPrompt });
@@ -494,11 +495,11 @@ const TopBar: React.FC = () => {
             onClick={() => setSelectedProject(null)}
             title="Return to Home"
           >
-            ← 首頁
+            <ArrowLeft size={13} style={{ marginRight: 4 }} />首頁
           </button>
         ) : (
           <>
-            <span className="topbar-logo">🏗</span>
+            <span className="topbar-logo"><BuildIcon size={16} /></span>
             <span className="topbar-title">Code Architect</span>
           </>
         )}
@@ -528,11 +529,13 @@ const TopBar: React.FC = () => {
               onClick={handleRefresh}
               disabled={isSubmitting}
             >
-              ⚡ {freshnessStatus.changedCount} 變動
+              <Zap size={12} style={{ marginRight: 3 }} />{freshnessStatus.changedCount} 變動
             </button>
           )}
           {!isRunning && freshnessStatus && !freshnessStatus.isStale && appView === 'workspace' && (
-            <span className="topbar-freshness-fresh" title="所有追蹤檔案均為最新">✅ 最新</span>
+            <span className="topbar-freshness-fresh" title="所有追蹤檔案均為最新">
+              <CheckCircle size={12} style={{ marginRight: 3 }} />最新
+            </span>
           )}
           {appView === 'workspace' && agentSession && (
             <button
@@ -540,7 +543,7 @@ const TopBar: React.FC = () => {
               onClick={handleRollback}
               title="Roll back all agent changes (git checkout base branch)"
             >
-              🔄 Rollback
+              <RotateCcw size={12} style={{ marginRight: 4 }} />Rollback
             </button>
           )}
           {appView === 'workspace' && selectedProject && (
@@ -550,7 +553,7 @@ const TopBar: React.FC = () => {
               disabled={isRunning || isSubmitting}
               title="只重新分析新增或變動的檔案"
             >
-              ⚡ Refresh
+              <Zap size={12} style={{ marginRight: 3 }} />Refresh
             </button>
           )}
           {appView === 'workspace' && (
@@ -559,7 +562,7 @@ const TopBar: React.FC = () => {
             </button>
           )}
           <button className="topbar-btn" onClick={() => setDarkMode(!darkMode)} title="Toggle dark mode">
-            {darkMode ? '☀️' : '🌙'}
+            {darkMode ? <Sun size={13} /> : <Moon size={13} />}
           </button>
         </div>
       </header>
@@ -600,7 +603,7 @@ const TopBar: React.FC = () => {
                   }
                 }}
               >
-                {picking ? '…' : '📁 Choose Folder'}
+                {picking ? '…' : <><Folder size={12} style={{ marginRight: 4 }} />Choose Folder</>}
               </button>
             </div>
 

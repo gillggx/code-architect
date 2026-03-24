@@ -1226,6 +1226,10 @@ def create_app(debug: bool = False) -> FastAPI:
         session_id = f"a2a-{request.project_id or 'global'}"
         session = get_or_create_session(session_id, request.project_id)
 
+        # Ensure project modules are loaded into chat engine context
+        if request.project_id:
+            _load_project_modules(request.project_id)
+
         # Prefix with query type so the LLM tailors its answer
         type_prefix = {
             "architecture": "Describe the architecture: ",

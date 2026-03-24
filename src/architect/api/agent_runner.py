@@ -1177,14 +1177,14 @@ Now generate the real plan for the task above. You may include plan_b if there i
                 for s in plan_a.steps
             )
             briefing = (
-                f"🚀 Task: {self.task[:120]}\n\n"
+                f"[TASK] {self.task[:120]}\n\n"
                 f"Execution plan — {len(plan_a.steps)} step{'s' if len(plan_a.steps) != 1 else ''}"
                 f" ({int(plan_a.confidence * 100)}% confidence, {plan_a.risk_level} risk):\n"
                 f"{step_lines}\n\n"
                 f"▶ Starting Step 1..."
             )
         else:
-            briefing = f"🚀 Starting: {self.task[:120]}"
+            briefing = f"[TASK] Starting: {self.task[:120]}"
         yield ToolCallEvent(type="message", content=briefing)
 
         for chunk_idx, chunk_steps in enumerate(chunks):

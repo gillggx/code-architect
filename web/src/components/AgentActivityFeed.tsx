@@ -8,6 +8,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import {
+  FolderOpen, Code2, Bot, CheckCircle, Database, Tag, Minus,
+  CheckCircle2, XCircle, Wrench, ArrowUpFromLine, Clock,
+  MessageSquare, ClipboardList, AlertTriangle, KeyRound,
+  Activity, Network, Pencil, ChevronRight,
+  type LucideIcon,
+} from 'lucide-react';
 import { useAgentEvents, useChat, useAppStore, AgentEvent, ChatMessage } from '../store/app';
 import { PlanCard } from './PlanCard';
 import { EscalationCard } from './EscalationCard';
@@ -17,25 +24,25 @@ import DependencyGraph from './DependencyGraph';
 // ---------------------------------------------------------------------------
 // Event metadata
 // ---------------------------------------------------------------------------
-interface EventMeta { icon: string; label: string; color: string; bold?: boolean; }
+interface EventMeta { Icon: LucideIcon; label: string; color: string; bold?: boolean; }
 
 const EVENT_META: Partial<Record<AgentEvent['type'], EventMeta>> = {
-  scan:              { icon: '📂', label: 'Scan',       color: '#888' },
-  ast:               { icon: '🔍', label: 'AST',        color: '#2980b9' },
-  llm_start:         { icon: '🤖', label: 'Reading',    color: '#e67e22' },
-  llm_done:          { icon: '✅', label: 'Done',       color: '#27ae60' },
-  memory:            { icon: '💾', label: 'Memory',     color: '#8e44ad' },
-  pattern:           { icon: '🏷',  label: 'Pattern',   color: '#16a085' },
-  skip:              { icon: '➖', label: 'Skip',        color: '#aaa' },
-  done:              { icon: '🎉', label: 'Complete',   color: '#27ae60', bold: true },
-  error:             { icon: '❌', label: 'Error',      color: '#c0392b' },
-  tool_call:         { icon: '🔧', label: 'Tool',       color: '#2980b9' },
-  tool_output:       { icon: '📤', label: 'Output',     color: '#27ae60' },
-  approval_required: { icon: '⏳', label: 'Approval',  color: '#e67e22', bold: true },
-  message:           { icon: '💬', label: 'Message',   color: '#555' },
-  plan:              { icon: '📋', label: 'Plan',       color: '#8e44ad', bold: true },
-  escalation:        { icon: '🚨', label: 'Escalation', color: '#c0392b', bold: true },
-  session:           { icon: '🔑', label: 'Session',   color: '#888' },
+  scan:              { Icon: FolderOpen,       label: 'Scan',       color: '#888' },
+  ast:               { Icon: Code2,            label: 'AST',        color: '#2980b9' },
+  llm_start:         { Icon: Bot,              label: 'Reading',    color: '#e67e22' },
+  llm_done:          { Icon: CheckCircle,      label: 'Done',       color: '#27ae60' },
+  memory:            { Icon: Database,         label: 'Memory',     color: '#8e44ad' },
+  pattern:           { Icon: Tag,              label: 'Pattern',    color: '#16a085' },
+  skip:              { Icon: Minus,            label: 'Skip',       color: '#aaa' },
+  done:              { Icon: CheckCircle2,     label: 'Complete',   color: '#27ae60', bold: true },
+  error:             { Icon: XCircle,          label: 'Error',      color: '#c0392b' },
+  tool_call:         { Icon: Wrench,           label: 'Tool',       color: '#2980b9' },
+  tool_output:       { Icon: ArrowUpFromLine,  label: 'Output',     color: '#27ae60' },
+  approval_required: { Icon: Clock,            label: 'Approval',   color: '#e67e22', bold: true },
+  message:           { Icon: MessageSquare,    label: 'Message',    color: '#555' },
+  plan:              { Icon: ClipboardList,    label: 'Plan',       color: '#8e44ad', bold: true },
+  escalation:        { Icon: AlertTriangle,    label: 'Escalation', color: '#c0392b', bold: true },
+  session:           { Icon: KeyRound,         label: 'Session',    color: '#888' },
 };
 
 function fmtTime(d: Date): string { return d.toTimeString().slice(0, 8); }
@@ -180,18 +187,23 @@ const ApprovalCard: React.FC<{ event: AgentEvent }> = ({ event }) => {
 // ---------------------------------------------------------------------------
 const BriefingMessage: React.FC<{ content: string }> = ({ content }) => {
   const parts = content.split('\n\n');
-  const header = parts[0] ?? '';
+  // Strip leading emoji/marker from header for clean display
+  const rawHeader = parts[0] ?? '';
+  const header = rawHeader.replace(/^[\u{1F000}-\u{1FFFF}\u{2600}-\u{27FF}]\s*/u, '').replace(/^\[TASK\]\s*/, '');
   const body = parts.slice(1).join('\n\n');
   return (
     <div className="briefing-message">
-      <div className="briefing-header">{header}</div>
+      <div className="briefing-header">
+        <ChevronRight size={13} style={{ marginRight: 4, flexShrink: 0 }} />
+        {header}
+      </div>
       {body && <pre className="briefing-body">{body}</pre>}
     </div>
   );
 };
 
 function isBriefingMessage(content: string): boolean {
-  return content.startsWith('🚀');
+  return content.startsWith('🚀') || content.startsWith('[TASK]');
 }
 
 // ---------------------------------------------------------------------------
@@ -199,14 +211,14 @@ function isBriefingMessage(content: string): boolean {
 // ---------------------------------------------------------------------------
 const EventRow: React.FC<{ event: AgentEvent }> = ({ event }) => {
   const [expanded, setExpanded] = useState(false);
-  const meta = EVENT_META[event.type] ?? { icon: '•', label: event.type, color: '#888' };
+  const meta = EVENT_META[event.type] ?? { Icon: Activity, label: event.type, color: '#888' };
 
   // Special rendering for approval_required
   if (event.type === 'approval_required') {
     return (
       <div className={`event-row event-row-approval_required`}>
         <span className="event-time">{fmtTime(event.timestamp)}</span>
-        <span className="event-icon">{meta.icon}</span>
+        <span className="event-icon"><meta.Icon size={13} color={meta.color} /></span>
         <span className="event-label" style={{ color: meta.color, fontWeight: 700 }}>
           {meta.label} required — {event.tool}
         </span>
@@ -220,7 +232,7 @@ const EventRow: React.FC<{ event: AgentEvent }> = ({ event }) => {
     return (
       <div className="event-row event-row-plan">
         <span className="event-time">{fmtTime(event.timestamp)}</span>
-        <span className="event-icon">{meta.icon}</span>
+        <span className="event-icon"><meta.Icon size={13} color={meta.color} /></span>
         <span className="event-label" style={{ color: meta.color, fontWeight: 700 }}>
           {meta.label}
         </span>
@@ -234,7 +246,7 @@ const EventRow: React.FC<{ event: AgentEvent }> = ({ event }) => {
     return (
       <div className="event-row event-row-escalation">
         <span className="event-time">{fmtTime(event.timestamp)}</span>
-        <span className="event-icon">{meta.icon}</span>
+        <span className="event-icon"><meta.Icon size={13} color={meta.color} /></span>
         <span className="event-label" style={{ color: meta.color, fontWeight: 700 }}>
           {meta.label}
         </span>
@@ -253,7 +265,7 @@ const EventRow: React.FC<{ event: AgentEvent }> = ({ event }) => {
     return (
       <div className="event-row event-row-tool_call">
         <span className="event-time">{fmtTime(event.timestamp)}</span>
-        <span className="event-icon">{meta.icon}</span>
+        <span className="event-icon"><meta.Icon size={13} color={meta.color} /></span>
         <span className="event-label" style={{ color: meta.color }}>{event.tool}</span>
         <span className="event-msg">{argsStr}</span>
       </div>
@@ -266,7 +278,7 @@ const EventRow: React.FC<{ event: AgentEvent }> = ({ event }) => {
     return (
       <div className="event-row event-row-tool_output">
         <span className="event-time">{fmtTime(event.timestamp)}</span>
-        <span className="event-icon">{meta.icon}</span>
+        <span className="event-icon"><meta.Icon size={13} color={meta.color} /></span>
         <span className="event-label" style={{ color: meta.color }}>{event.tool}</span>
         <span className="event-msg">{(event.result ?? '').slice(0, 120)}</span>
         {hasDiff && (
@@ -417,14 +429,14 @@ const AgentActivityFeed: React.FC = () => {
             className={`panel-tab${centerTab === 'activity' ? ' active' : ''}`}
             onClick={() => setCenterTab('activity')}
           >
-            🤖 Activity
+            <Bot size={12} style={{ marginRight: 4 }} />Activity
             {visibleCount > 0 && <span className="tab-badge">{visibleCount}</span>}
           </button>
           <button
             className={`panel-tab${centerTab === 'chat' ? ' active' : ''}`}
             onClick={() => setCenterTab('chat')}
           >
-            💬 Chat
+            <MessageSquare size={12} style={{ marginRight: 4 }} />Chat
             {chatMessages.length > 0 && <span className="tab-badge">{chatMessages.length}</span>}
           </button>
           {editMode && openedFile && (
@@ -433,23 +445,23 @@ const AgentActivityFeed: React.FC = () => {
                 className="panel-tab-label"
                 onClick={() => setCenterTab('file')}
               >
-                ✎ {openedFile.path.split('/').pop()}
+                <Pencil size={11} style={{ marginRight: 3 }} />{openedFile.path.split('/').pop()}
               </span>
               <button
                 className="panel-tab-close"
-                title="關閉檔案"
+                title="Close file"
                 onClick={() => {
                   setOpenedFile(null);
                   setCenterTab('activity');
                 }}
-              >✕</button>
+              >&#x2715;</button>
             </span>
           )}
           <button
             className={`panel-tab${centerTab === 'graph' ? ' active' : ''}`}
             onClick={() => setCenterTab('graph')}
           >
-            🕸 Graph
+            <Network size={12} style={{ marginRight: 4 }} />Graph
           </button>
         </div>
         <div className="panel-header-actions">
@@ -466,14 +478,14 @@ const AgentActivityFeed: React.FC = () => {
       {centerTab === 'activity' && (
         events.length === 0 ? (
           <div className="empty-state">
-            <div className="empty-state-icon">🤖</div>
+            <div className="empty-state-icon"><Bot size={32} strokeWidth={1.5} /></div>
             <div className="empty-state-text">Analyze a project to see the agent at work</div>
           </div>
         ) : (
           <>
             {activeStep && (
               <div className="activity-active-step-bar">
-                <span className="activity-active-step-icon">▶</span>
+                <span className="activity-active-step-icon"><ChevronRight size={13} /></span>
                 <span className="activity-active-step-text">{activeStep}</span>
               </div>
             )}
@@ -493,7 +505,7 @@ const AgentActivityFeed: React.FC = () => {
       {centerTab === 'chat' && (
         chatMessages.length === 0 ? (
           <div className="empty-state">
-            <div className="empty-state-icon">💬</div>
+            <div className="empty-state-icon"><MessageSquare size={32} strokeWidth={1.5} /></div>
             <div className="empty-state-text">Ask anything about the project…</div>
           </div>
         ) : (

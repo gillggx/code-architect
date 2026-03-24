@@ -5,16 +5,17 @@
  */
 
 import React, { useState } from 'react';
+import { Clock, RefreshCw, CheckCircle, Minus, FolderOpen, Folder, ChevronUp, ChevronDown, Pencil, type LucideIcon } from 'lucide-react';
 import { useFileTree, useJob, useAppStore, FileNode } from '../store/app';
 
 // ---------------------------------------------------------------------------
 // Status icon + color
 // ---------------------------------------------------------------------------
-const STATUS_ICON: Record<FileNode['status'], string> = {
-  pending: '⏳',
-  analyzing: '🔄',
-  done: '✅',
-  skipped: '➖',
+const STATUS_ICON: Record<FileNode['status'], LucideIcon> = {
+  pending:   Clock,
+  analyzing: RefreshCw,
+  done:      CheckCircle,
+  skipped:   Minus,
 };
 
 const STATUS_COLOR: Record<FileNode['status'], string> = {
@@ -59,23 +60,27 @@ const FileRow: React.FC<FileRowProps> = ({ node, modified, editMode, onOpenFile 
           className="file-status-icon"
           style={{ color: STATUS_COLOR[node.status] }}
         >
-          {STATUS_ICON[node.status]}
+          {React.createElement(STATUS_ICON[node.status], { size: 12 })}
         </span>
         <span className="file-name">{node.name}</span>
         {modified && (
           <span
             className="file-modified-dot"
             title="Modified by edit agent"
-            style={{ color: '#e67e22', marginLeft: 4 }}
+            style={{ color: '#e67e22', marginLeft: 4, fontSize: '0.7rem' }}
           >
-            ●
+            &#x25CF;
           </span>
         )}
         {!editMode && node.summary && (
-          <span className="file-expand-toggle">{expanded ? '▲' : '▼'}</span>
+          <span className="file-expand-toggle">
+            {expanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+          </span>
         )}
         {editMode && !node.isDir && (
-          <span className="file-open-hint" style={{ color: '#888', fontSize: '0.65rem', marginLeft: 4 }}>✎</span>
+          <span className="file-open-hint" style={{ color: '#888', marginLeft: 4 }}>
+            <Pencil size={10} />
+          </span>
         )}
       </div>
       {!editMode && expanded && node.summary && (
@@ -110,7 +115,7 @@ const FileTree: React.FC = () => {
   return (
     <div className="panel-left">
       <div className="panel-header">
-        <span>📁 Files</span>
+        <span><Folder size={13} style={{ marginRight: 5 }} />Files</span>
         {total > 0 && (
           <span style={{ fontWeight: 400, fontSize: '0.72rem' }}>({total})</span>
         )}
@@ -120,14 +125,14 @@ const FileTree: React.FC = () => {
             title={`${modifiedFiles.size} file(s) modified by edit agent`}
             style={{ color: '#e67e22', fontSize: '0.72rem', marginLeft: 4 }}
           >
-            ● {modifiedFiles.size} edited
+            &#x25CF; {modifiedFiles.size} edited
           </span>
         )}
       </div>
 
       {total === 0 ? (
         <div className="empty-state">
-          <div className="empty-state-icon">📂</div>
+          <div className="empty-state-icon"><FolderOpen size={32} strokeWidth={1.5} /></div>
           <div className="empty-state-text">
             Analyze a project to see files
           </div>

@@ -4,6 +4,7 @@
  */
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Wrench as BuildIcon, Search, Sparkles, FolderOpen, Folder, ArrowLeft, FileText, Hammer } from 'lucide-react';
 import { useAppStore, ChatMessage } from '../store/app';
 import ProjectManagerPanel from './ProjectManagerPanel';
 
@@ -44,7 +45,7 @@ const FolderBrowser: React.FC<{
     <div className="folder-browser home-folder-browser">
       <div className="folder-browser-path">
         {parent && (
-          <button className="folder-browser-up" onClick={() => navigate(parent)}>← Up</button>
+          <button className="folder-browser-up" onClick={() => navigate(parent)}><ArrowLeft size={12} style={{ marginRight: 3 }} />Up</button>
         )}
         <span className="folder-browser-current" title={currentPath}>{currentPath}</span>
       </div>
@@ -53,7 +54,7 @@ const FolderBrowser: React.FC<{
         {entries.filter(e => e.is_dir).map(e => (
           <div key={e.path} className="folder-browser-entry">
             <button className="folder-browser-nav" onClick={() => navigate(e.path)}>
-              📁 {e.name}
+              <Folder size={12} style={{ marginRight: 4 }} />{e.name}
             </button>
             <button className="folder-browser-select" onClick={() => onSelect(e.path)}>
               Select
@@ -332,7 +333,7 @@ const HomeView: React.FC = () => {
       {newProjectStep === 'idle' && (
         <>
           <div className="home-hero">
-            <div className="home-hero-icon">🏗</div>
+            <div className="home-hero-icon"><BuildIcon size={40} strokeWidth={1.5} /></div>
             <h1 className="home-hero-title">Code Architect</h1>
             <p className="home-hero-subtitle">你的 AI 程式碼設計夥伴</p>
           </div>
@@ -342,7 +343,7 @@ const HomeView: React.FC = () => {
               className="home-card"
               onClick={() => setShowAnalyzeModal(true)}
             >
-              <span className="home-card-icon">🔍</span>
+              <span className="home-card-icon"><Search size={28} strokeWidth={1.5} /></span>
               <span className="home-card-title">解析專案</span>
               <span className="home-card-desc">分析現有程式碼庫，建立架構記憶</span>
             </button>
@@ -356,7 +357,7 @@ const HomeView: React.FC = () => {
                 setNewProjectStep('chatting');
               }}
             >
-              <span className="home-card-icon">✨</span>
+              <span className="home-card-icon"><Sparkles size={28} strokeWidth={1.5} /></span>
               <span className="home-card-title">建新專案</span>
               <span className="home-card-desc">從零開始，AI 幫你規劃並生成專案</span>
             </button>
@@ -365,7 +366,7 @@ const HomeView: React.FC = () => {
               className="home-card"
               onClick={() => setShowProjectManager(true)}
             >
-              <span className="home-card-icon">🗂</span>
+              <span className="home-card-icon"><FolderOpen size={28} strokeWidth={1.5} /></span>
               <span className="home-card-title">專案管理</span>
               <span className="home-card-desc">管理已分析的歷史專案</span>
             </button>
@@ -381,9 +382,9 @@ const HomeView: React.FC = () => {
               className="home-back-btn"
               onClick={() => { setNewProjectStep('idle'); clearNewProjectMessages(); }}
             >
-              ← 返回
+              <ArrowLeft size={13} style={{ marginRight: 4 }} />返回
             </button>
-            <span className="home-chat-title">✨ 規劃新專案</span>
+            <span className="home-chat-title"><Sparkles size={14} style={{ marginRight: 5 }} />規劃新專案</span>
           </div>
 
           <div className="home-chat-area">
@@ -436,9 +437,9 @@ const HomeView: React.FC = () => {
               className="home-back-btn"
               onClick={() => setNewProjectStep('chatting')}
             >
-              ← 修改 Spec
+              <ArrowLeft size={13} style={{ marginRight: 4 }} />修改 Spec
             </button>
-            <span className="home-chat-title">📄 專案規格確認</span>
+            <span className="home-chat-title"><FileText size={14} style={{ marginRight: 5 }} />專案規格確認</span>
           </div>
 
           <div className="spec-preview">
@@ -458,7 +459,7 @@ const HomeView: React.FC = () => {
                 className="modal-btn browse-btn"
                 onClick={() => setShowBuildDirBrowser(!showBuildDirBrowser)}
               >
-                📁 選擇
+                <Folder size={12} style={{ marginRight: 4 }} />選擇
               </button>
             </div>
 
@@ -504,7 +505,7 @@ const HomeView: React.FC = () => {
       {/* ── Building ── */}
       {newProjectStep === 'building' && (
         <div className="home-building">
-          <div className="home-building-spinner">🔨</div>
+          <div className="home-building-spinner"><Hammer size={32} strokeWidth={1.5} /></div>
           <p>正在建立專案，請稍候…</p>
         </div>
       )}
@@ -544,7 +545,7 @@ const HomeView: React.FC = () => {
                   }
                 }}
               >
-                📁 Choose Folder
+                <Folder size={12} style={{ marginRight: 4 }} />Choose Folder
               </button>
             </div>
 
