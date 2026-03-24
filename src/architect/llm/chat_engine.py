@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import AsyncIterator, List, Optional, Dict, Any
+from typing import AsyncIterator, List, Optional, Dict, Any, Literal
 
 from .client import LLMClient, create_llm_client, DEFAULT_MODEL
 from .model_router import ModelRouter, create_model_router
@@ -28,6 +29,51 @@ logger = logging.getLogger(__name__)
 MAX_CONTEXT_CHUNKS = 8
 # Max conversation turns kept in memory
 MAX_HISTORY_TURNS = 10
+
+# ---------------------------------------------------------------------------
+# Query classification
+# ---------------------------------------------------------------------------
+
+QueryRoute = Literal["MAP_ONLY", "MAP_THEN_JIT", "FULL_CONTEXT"]
+
+_MAP_ONLY_PATTERNS = re.compile(
+    r"(影響|affect|depend|import|誰呼叫|who call|called by|uses|用到|"
+    r"架構|architecture|pattern|模式|禁止|forbidden|規範|convention|"
+    r"side effect|有沒有副作用|critical|核心路徑|overview|概覽|"
+    r"what does .+ do|這個.*做什麼|purpose|用途)",
+    re.IGNORECASE,
+)
+
+_FULL_CONTEXT_PATTERNS = re.compile(
+    r"(整個流程|entire flow|end.to.end|從頭到尾|all files|所有檔案|"
+    r"跨.*模組|across.*module|system.wide|全系統)",
+    re.IGNORECASE,
+)
+
+_JIT_PATTERNS = re.compile(
+    r"(怎麼實作|how.*implement|實作細節|implementation|邏輯|logic|"
+    r"怎麼寫的|how is .+ written|細節|detail|具體|specific|"
+    r"幫我.*改|幫我.*加|幫我.*修|add|edit|modify|fix|change|implement|"
+    r"show me|讓我看|給我看|the code|程式碼)",
+    re.IGNORECASE,
+)
+
+
+def _classify_query(query: str) -> QueryRoute:
+    """
+    Route the query to the appropriate context strategy:
+      MAP_ONLY     — answer directly from L2 contract map (no file reads)
+      MAP_THEN_JIT — use map to locate, then read targeted code snippet
+      FULL_CONTEXT — need code from multiple files (rare)
+    """
+    if _FULL_CONTEXT_PATTERNS.search(query):
+        return "FULL_CONTEXT"
+    if _JIT_PATTERNS.search(query):
+        return "MAP_THEN_JIT"
+    if _MAP_ONLY_PATTERNS.search(query):
+        return "MAP_ONLY"
+    # Default: try map first; JIT if map has enough location info
+    return "MAP_THEN_JIT"
 
 
 @dataclass
@@ -149,17 +195,26 @@ class ChatEngine:
     async def _retrieve_context(
         self, query: str, project_id: Optional[str]
     ) -> Dict[str, Any]:
-        """Pull relevant context from code memory."""
+        """Pull relevant context from code memory, routed by query type."""
+        route = _classify_query(query)
+        logger.info("Query route: %s for: %s", route, query[:60])
+
         context: Dict[str, Any] = {
             "patterns": [],
             "semantic_chunks": [],
             "keyword_hits": [],
             "modules": [],
+            "route": route,
+            "jit_snippets": [],   # Phase 3: targeted code reads
         }
 
         # Inject stored LLM analysis modules for this project
         if project_id and project_id in self._project_modules:
             context["modules"] = self._project_modules[project_id]
+
+        # Phase 3: JIT code retrieval — locate relevant symbols then read only those lines
+        if route in ("MAP_THEN_JIT", "FULL_CONTEXT") and project_id:
+            context["jit_snippets"] = self._jit_retrieve(query, project_id)
 
         if not self.rag and not self.memory:
             return context
@@ -216,6 +271,82 @@ class ChatEngine:
         messages.append({"role": "user", "content": user_message})
 
         return messages
+
+    def _jit_retrieve(self, query: str, project_id: str) -> List[Dict[str, Any]]:
+        """
+        Phase 3 — JIT Code Retrieval.
+        Use the contract map to locate relevant symbols, then read only those
+        lines from disk. Returns a list of {file, symbol, lines, code} dicts.
+        """
+        modules = self._project_modules.get(project_id, [])
+        if not modules:
+            return []
+
+        query_lower = query.lower()
+        snippets: List[Dict[str, Any]] = []
+
+        for mod in modules:
+            path = mod.get("path", "")
+            if not path or not os.path.isfile(path):
+                continue
+
+            symbols = mod.get("symbols", [])
+            # Score: does query mention this module's name or any symbol name?
+            mod_name = (mod.get("name") or "").lower()
+            public_iface = " ".join(mod.get("public_interface", [])).lower()
+            combined = f"{mod_name} {public_iface} {mod.get('purpose','').lower()}"
+
+            # Simple keyword match — if query terms hit this module
+            query_words = set(re.findall(r'\w+', query_lower))
+            mod_words = set(re.findall(r'\w+', combined))
+            overlap = query_words & mod_words
+            if len(overlap) < 2 and mod_name not in query_lower:
+                continue
+
+            # Find matching symbol by name
+            matched_syms = [
+                s for s in symbols
+                if s.get("name", "").lower() in query_lower
+            ]
+
+            if matched_syms:
+                # Read only the matching function/class lines
+                for sym in matched_syms[:2]:
+                    start = max(0, sym.get("line_start", 1) - 1)
+                    end = sym.get("line_end", start + 30)
+                    code = self._read_lines(path, start, end)
+                    if code:
+                        snippets.append({
+                            "file": path,
+                            "symbol": sym.get("name"),
+                            "lines": f"{start+1}-{end}",
+                            "code": code,
+                        })
+            else:
+                # No specific symbol matched — read first 40 lines as overview
+                code = self._read_lines(path, 0, 40)
+                if code:
+                    snippets.append({
+                        "file": path,
+                        "symbol": None,
+                        "lines": "1-40",
+                        "code": code,
+                    })
+
+            if len(snippets) >= 3:
+                break
+
+        return snippets
+
+    @staticmethod
+    def _read_lines(path: str, start: int, end: int) -> str:
+        """Read lines [start, end) from a file. Returns empty string on error."""
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                all_lines = f.readlines()
+            return "".join(all_lines[start:end])
+        except OSError:
+            return ""
 
     def _load_soul(self, project_id: Optional[str]) -> str:
         """Load SOUL.md for the current project."""
@@ -288,18 +419,63 @@ class ChatEngine:
             hit_types = list({h["type"] for h in kw_hits})
             lines.append(f"## Memory Artifacts Referenced\nTypes found: {', '.join(hit_types)}\n")
 
-        # Inject per-file module summaries from LLM analysis
+        # Inject per-file module contracts from LLM analysis
         modules = context.get("modules", [])
+        route = context.get("route", "MAP_THEN_JIT")
+
         if modules:
-            lines.append("## Analyzed Files (from last analysis run)")
-            for mod in modules[:30]:  # cap to avoid token overflow
-                name = mod.get("name") or mod.get("file", "unknown")
-                purpose = mod.get("purpose") or mod.get("summary", "")
-                patterns_in = mod.get("patterns", [])
-                line = f"- **{name}**: {purpose}"
-                if patterns_in:
-                    line += f" [patterns: {', '.join(patterns_in[:3])}]"
-                lines.append(line)
+            if route == "MAP_ONLY":
+                # MAP_ONLY: inject full contracts — no code needed
+                lines.append("## Architecture Map (answer from this — no need to read code)")
+                for mod in modules[:30]:
+                    name = mod.get("name") or mod.get("file", "unknown")
+                    purpose = mod.get("purpose", "")
+                    iface = mod.get("public_interface", [])
+                    pre = mod.get("pre_conditions", [])
+                    fx = mod.get("side_effects", [])
+                    biz = mod.get("business_rule", "")
+                    fragile = mod.get("fragile_points", [])
+                    critical = mod.get("critical_path", False)
+                    imported_by = mod.get("imported_by", [])
+
+                    lines.append(f"\n### {name}{' 🔴 critical' if critical else ''}")
+                    lines.append(f"**Purpose:** {purpose}")
+                    if iface:
+                        lines.append(f"**Interface:** {', '.join(iface[:4])}")
+                    if pre:
+                        lines.append(f"**Pre-conditions:** {'; '.join(pre[:3])}")
+                    if fx:
+                        lines.append(f"**Side effects:** {'; '.join(fx[:3])}")
+                    if biz and biz.lower() != "none":
+                        lines.append(f"**Business rule:** {biz}")
+                    if fragile:
+                        lines.append(f"**Fragile points:** {'; '.join(fragile[:2])}")
+                    if imported_by:
+                        lines.append(f"**Used by:** {', '.join(imported_by[:4])}")
+                lines.append("")
+
+            else:
+                # MAP_THEN_JIT / FULL_CONTEXT: compact map for navigation
+                lines.append("## Architecture Map (use for navigation)")
+                for mod in modules[:30]:
+                    name = mod.get("name") or mod.get("file", "unknown")
+                    purpose = mod.get("purpose", "")
+                    patterns_in = mod.get("patterns", [])
+                    critical = mod.get("critical_path", False)
+                    entry = f"- **{name}**{' 🔴' if critical else ''}: {purpose}"
+                    if patterns_in:
+                        entry += f" [{', '.join(patterns_in[:2])}]"
+                    lines.append(entry)
+                lines.append("")
+
+        # Phase 3: inject JIT code snippets
+        jit_snippets = context.get("jit_snippets", [])
+        if jit_snippets:
+            lines.append("## Relevant Code (read just-in-time for this query)")
+            for s in jit_snippets:
+                sym_label = f" — `{s['symbol']}`" if s.get("symbol") else ""
+                lines.append(f"\n### {s['file']}{sym_label} (lines {s['lines']})")
+                lines.append(f"```\n{s['code'].strip()}\n```")
             lines.append("")
 
         if not semantic and not patterns and not kw_hits and not modules:

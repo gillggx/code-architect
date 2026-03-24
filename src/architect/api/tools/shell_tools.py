@@ -56,8 +56,10 @@ ALLOWED_COMMANDS: List[str] = [
     # Git (read-only + init)
     r"git\s+init(\s|$)",
     r"git\s+(status|diff|log|show|blame)(\s|$)",
-    # Directory creation
+    # Directory / file operations
     r"mkdir(\s|$)",
+    r"chmod(\s|$)",        # Ubuntu: make scripts executable
+    r"touch(\s|$)",
     # File exploration (read-only)
     r"find(\s|$)",
     r"ls(\s|$)",
@@ -66,10 +68,25 @@ ALLOWED_COMMANDS: List[str] = [
     r"tail(\s|$)",
     r"wc(\s|$)",
     r"grep(\s|$)",
+    r"echo(\s|$)",
+    # Tool discovery (Ubuntu needs these to locate binaries)
+    r"which(\s|$)",
+    r"command\s+-v(\s|$)",
+    r"type(\s|$)",
+    # Venv activation (POSIX: `. path/activate`)
+    r"\.\s+\S+",           # `. venv/bin/activate`
+    r"source(\s|$)",       # `source venv/bin/activate` (bash)
+    # OS info
+    r"uname(\s|$)",
+    r"python3?\s+--version(\s|$)",
+    r"node\s+--version(\s|$)",
+    r"npm\s+--version(\s|$)",
 ]
 
 # Commands allowed when prefixed with "cd <path> && <cmd>"
-_CD_PREFIX = re.compile(r"^cd\s+\S+\s*&&\s*(.+)$")
+# Supports quoted paths: cd "/path/with spaces" && cmd
+# and unquoted paths:    cd /simple/path && cmd
+_CD_PREFIX = re.compile(r'^cd\s+(?:"[^"]*"|\'[^\']*\'|\S+)\s*&&\s*(.+)$')
 _COMPILED: List[re.Pattern] = [re.compile(p) for p in ALLOWED_COMMANDS]
 
 
@@ -89,7 +106,7 @@ def _is_allowed(cmd: str) -> bool:
 def run_command(
     cmd: str,
     project_path: str,
-    timeout: int = 30,
+    timeout: int = 60,
     shell_unrestricted: bool = False,
 ) -> Dict[str, Any]:
     """Run *cmd* in *project_path* if it matches the allowlist.
@@ -116,6 +133,7 @@ def run_command(
         result = subprocess.run(
             cmd,
             shell=True,
+            executable="/bin/bash",   # use bash (not dash) so `source` works on Ubuntu
             cwd=project_path,
             capture_output=True,
             text=True,

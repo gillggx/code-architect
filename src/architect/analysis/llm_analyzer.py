@@ -742,18 +742,31 @@ class LLMAnalyzer:
     # ------------------------------------------------------------------
 
     def _build_file_prompt(self, file_path: str, content: str) -> str:
-        """Build the edit-oriented analysis prompt for a single file."""
+        """Build the contract-oriented analysis prompt for a single file."""
         language = self._detect_language(file_path)
         return (
-            f"You are preparing a code-editing reference for a {language} file. "
+            f"You are a senior architect building a navigation map for a {language} file. "
+            "Your goal is NOT to summarize — it is to extract a precise CONTRACT that lets "
+            "another agent answer questions WITHOUT reading the source code.\n\n"
             "Return JSON with these keys:\n"
-            "- purpose: 1 sentence describing what this file does\n"
+            "- purpose: 1 sentence — what business problem this file solves\n"
             "- key_components: list of class/function names exported or defined\n"
             "- dependencies: list of imports/requires\n"
             "- patterns: list of design patterns spotted\n"
-            "- edit_hints: 1 sentence — the most important gotcha when modifying this file "
-            "(e.g. coupling risks, constants that must stay in sync, side effects on callers, "
-            "or 'none' if straightforward)\n"
+            "- edit_hints: 1 sentence — the most important gotcha when modifying this file\n"
+            "- public_interface: list of exported function signatures with param types and return type "
+            "(e.g. ['verify_token(token: str) -> User', 'create_token(user_id: int) -> str'])\n"
+            "- pre_conditions: list of conditions that must be true before calling this module "
+            "(e.g. ['user must be authenticated', 'SECRET_KEY env var must be set']). Empty list if none.\n"
+            "- side_effects: list of observable effects beyond return value "
+            "(e.g. ['writes to DB', 'sends email', 'modifies global state']). Empty list if none.\n"
+            "- critical_path: true if this file is on a core business flow (payment, auth, data integrity), "
+            "false otherwise\n"
+            "- business_rule: 1 sentence — the key business logic or invariant this file enforces. "
+            "'none' if purely infrastructure.\n"
+            "- fragile_points: list of things most likely to break when this file changes "
+            "(e.g. ['callers that expect synchronous return', 'hardcoded timeout in line 42']). "
+            "Empty list if none.\n\n"
             f"File: {file_path}\n\n{content}"
         )
 
@@ -782,12 +795,17 @@ class LLMAnalyzer:
         )
 
         return (
-            f"You are incrementally analyzing a large {language} file ({file_path}). "
+            f"You are incrementally building a navigation contract for a large {language} file ({file_path}). "
             f"This is chunk {chunk_index}/{total_chunks}.\n"
             f"{memory_str}\n"
             f"Chunk content:\n{chunk}\n\n"
-            "Return JSON with keys: purpose, key_components, dependencies, patterns, "
-            "edit_hints (1 sentence: most important gotcha when modifying this file). "
+            "Return JSON with keys: purpose, key_components, dependencies, patterns, edit_hints, "
+            "public_interface (list of exported function signatures with types), "
+            "pre_conditions (list of required conditions before use — empty list if none), "
+            "side_effects (list of DB writes / external calls / state mutations — empty list if none), "
+            "critical_path (true/false), "
+            "business_rule (key invariant enforced, or 'none'), "
+            "fragile_points (list of likely breakage points — empty list if none). "
             f"{instruction}"
         )
 
