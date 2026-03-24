@@ -321,7 +321,7 @@ const EventRow: React.FC<{ event: AgentEvent }> = ({ event }) => {
   return (
     <div className={`event-row event-row-${event.type}`} style={{ fontWeight: meta.bold ? 700 : 400 }}>
       <span className="event-time">{fmtTime(event.timestamp)}</span>
-      <span className="event-icon">{meta.icon}</span>
+      <span className="event-icon"><meta.Icon size={14} /></span>
       <span className="event-label" style={{ color: meta.color }}>{meta.label}</span>
       <span className="event-msg">{displayMsg}</span>
       {hasSummary && (

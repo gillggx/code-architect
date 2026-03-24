@@ -257,6 +257,10 @@ interface AppStore {
   // Freshness status
   freshnessStatus: FreshnessStatus | null;
   setFreshnessStatus: (s: FreshnessStatus | null) => void;
+
+  // Chat escalation (tool-use mode escalated to Edit Agent)
+  chatEscalation: { task: string; reason: string } | null;
+  setChatEscalation: (e: { task: string; reason: string } | null) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +419,10 @@ export const useAppStore = create<AppStore>((set) => ({
   // Freshness status
   freshnessStatus: null,
   setFreshnessStatus: (s) => set({ freshnessStatus: s }),
+
+  // Chat escalation
+  chatEscalation: null,
+  setChatEscalation: (e) => set({ chatEscalation: e }),
 }));
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ Memory is read-only here — it stores code analysis results, not chat logs.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -190,6 +191,138 @@ class ChatEngine:
             chunks.append(chunk)
         return "".join(chunks)
 
+    async def stream_chat_v2(
+        self,
+        session: ChatSession,
+        user_message: str,
+        project_path: str,
+        analysis_status: Optional[str] = None,
+        recent_changes: Optional[str] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Tool-use chat mode.
+
+        Yields dicts with these shapes:
+          {"type": "tool_thinking", "tool": str, "args": dict}
+          {"type": "tool_result",   "tool": str, "result": str}
+          {"type": "tool_edit",     "path": str, "diff": str, "result": str}
+          {"type": "escalate",      "task": str, "reason": str}
+          {"type": "chunk",         "data": str}
+          {"type": "done"}
+          {"type": "error",         "data": str}
+
+        Phase 1: tool loop (non-streaming, max 8 rounds).
+        Phase 2: stream final answer as "chunk" events.
+        """
+        from ..api.tools.chat_tools import CHAT_TOOLS, execute_chat_tool
+
+        MAX_TOOL_ROUNDS = 8
+
+        # 1. Retrieve context (same as stream_chat)
+        context = await self._retrieve_context(user_message, session.project_id)
+
+        # 2. Build initial messages with tool-aware system prompt
+        system_prompt = self._build_system_prompt(
+            session.project_id, context,
+            analysis_status=analysis_status,
+            recent_changes=recent_changes,
+            tool_use=True,
+        )
+        messages: list[dict] = [{"role": "system", "content": system_prompt}]
+        messages.extend(session.to_openai_messages())
+        messages.append({"role": "user", "content": user_message})
+
+        # 3. Route model
+        if self.llm._use_custom or not self.llm._use_openrouter:
+            model = self.llm.model
+        else:
+            decision = self.router.route(user_message)
+            model = decision.primary_model
+
+        # 4. Add user turn to history
+        session.add("user", user_message)
+
+        edit_count = 0
+
+        # Phase 1: tool loop
+        for _round in range(MAX_TOOL_ROUNDS):
+            msg = await self.llm.complete_with_tools(messages, CHAT_TOOLS, model=model)
+            messages.append(msg)
+
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls:
+                # No more tool calls — move to streaming phase
+                break
+
+            # Execute each tool call
+            for tc in tool_calls:
+                fn_name = tc["function"]["name"]
+                try:
+                    fn_args = json.loads(tc["function"]["arguments"])
+                except (json.JSONDecodeError, KeyError):
+                    fn_args = {}
+
+                yield {"type": "tool_thinking", "tool": fn_name, "args": fn_args}
+
+                result = execute_chat_tool(fn_name, fn_args, project_path)
+
+                if result.get("escalate"):
+                    yield {
+                        "type": "escalate",
+                        "task": result["task"],
+                        "reason": result["reason"],
+                    }
+                    session.add("assistant", f"[Escalated to Edit Agent: {result['task']}]")
+                    return
+
+                if result.get("edited"):
+                    edit_count += 1
+                    yield {
+                        "type": "tool_edit",
+                        "path": result["path"],
+                        "diff": result.get("diff", ""),
+                        "result": result["result"],
+                    }
+
+                tool_content = result["result"] if result["ok"] else f"[Error: {result['error']}]"
+                yield {"type": "tool_result", "tool": fn_name, "result": tool_content}
+
+                # Check edit escalation threshold (>3 edits → suggest escalation)
+                if edit_count > 3:
+                    yield {
+                        "type": "escalate",
+                        "task": user_message,
+                        "reason": f"Made {edit_count} file edits — complex change better handled by Edit Agent",
+                    }
+                    session.add("assistant", "[Auto-escalated after multiple edits]")
+                    return
+
+                # Append tool result to messages
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": tool_content,
+                })
+
+        # Phase 2: stream final answer from last assistant message or a fresh call
+        final_content = msg.get("content", "") if not msg.get("tool_calls") else ""
+        if final_content:
+            # LLM already produced a final answer in the last round
+            reply_chunks: list[str] = []
+            for chunk in _chunk_string(final_content, 64):
+                reply_chunks.append(chunk)
+                yield {"type": "chunk", "data": chunk}
+            session.add("assistant", "".join(reply_chunks))
+        else:
+            # Need one more streaming call for the final answer
+            reply_chunks = []
+            async for chunk in self.llm.stream(messages, model=model):
+                reply_chunks.append(chunk)
+                yield {"type": "chunk", "data": chunk}
+            session.add("assistant", "".join(reply_chunks))
+
+        yield {"type": "done"}
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -311,13 +444,11 @@ class ChatEngine:
                 continue
 
             mod_name = (mod.get("name") or "").lower()
-            # Build a rich searchable string from all module fields
+            # Build a searchable string from module navigation fields
             combined = " ".join(filter(None, [
                 mod_name,
                 mod.get("purpose", ""),
                 " ".join(mod.get("public_interface", [])),
-                " ".join(mod.get("key_components", [])),
-                mod.get("business_rule", ""),
             ])).lower()
 
             if is_audit:
@@ -402,6 +533,7 @@ class ChatEngine:
         context: Dict[str, Any],
         analysis_status: Optional[str] = None,
         recent_changes: Optional[str] = None,
+        tool_use: bool = False,
     ) -> str:
         """Build system prompt with retrieved code context."""
 
@@ -460,47 +592,34 @@ class ChatEngine:
 
         if modules:
             if route == "MAP_ONLY":
-                # MAP_ONLY: inject full contracts — no code needed
-                lines.append("## Architecture Map (answer from this — no need to read code)")
+                # MAP_ONLY: inject module summaries for navigation
+                lines.append("## Architecture Map")
                 for mod in modules[:30]:
                     name = mod.get("name") or mod.get("file", "unknown")
                     purpose = mod.get("purpose", "")
                     iface = mod.get("public_interface", [])
-                    pre = mod.get("pre_conditions", [])
-                    fx = mod.get("side_effects", [])
-                    biz = mod.get("business_rule", "")
-                    fragile = mod.get("fragile_points", [])
                     critical = mod.get("critical_path", False)
                     imported_by = mod.get("imported_by", [])
+                    edit_hints = mod.get("edit_hints", "")
 
-                    lines.append(f"\n### {name}{' 🔴 critical' if critical else ''}")
+                    lines.append(f"\n### {name}{' [critical]' if critical else ''}")
                     lines.append(f"**Purpose:** {purpose}")
                     if iface:
                         lines.append(f"**Interface:** {', '.join(iface[:4])}")
-                    if pre:
-                        lines.append(f"**Pre-conditions:** {'; '.join(pre[:3])}")
-                    if fx:
-                        lines.append(f"**Side effects:** {'; '.join(fx[:3])}")
-                    if biz and biz.lower() != "none":
-                        lines.append(f"**Business rule:** {biz}")
-                    if fragile:
-                        lines.append(f"**Fragile points:** {'; '.join(fragile[:2])}")
                     if imported_by:
                         lines.append(f"**Used by:** {', '.join(imported_by[:4])}")
+                    if edit_hints and edit_hints.lower() not in ("none", ""):
+                        lines.append(f"**Edit hints:** {edit_hints}")
                 lines.append("")
 
             else:
                 # MAP_THEN_JIT / FULL_CONTEXT: compact map for navigation
-                lines.append("## Architecture Map (use for navigation)")
+                lines.append("## Architecture Map (use for navigation — read files for details)")
                 for mod in modules[:30]:
                     name = mod.get("name") or mod.get("file", "unknown")
                     purpose = mod.get("purpose", "")
-                    patterns_in = mod.get("patterns", [])
                     critical = mod.get("critical_path", False)
-                    entry = f"- **{name}**{' 🔴' if critical else ''}: {purpose}"
-                    if patterns_in:
-                        entry += f" [{', '.join(patterns_in[:2])}]"
-                    lines.append(entry)
+                    lines.append(f"- **{name}**{' [critical]' if critical else ''}: {purpose}")
                 lines.append("")
 
         # Phase 3: inject JIT code snippets
@@ -529,6 +648,24 @@ class ChatEngine:
             lines.append(
                 "Note: No project has been analyzed yet. "
                 "Ask the user to run an analysis first, or answer from general knowledge."
+            )
+
+        if tool_use:
+            lines.append(
+                "\n## Tools Available\n"
+                "You have tools to read and modify the codebase directly:\n\n"
+                "- `read_file(path)` — Read a file. Use before answering implementation questions.\n"
+                "- `search_files(query, directory?, file_pattern?)` — Grep across files.\n"
+                "- `edit_file(path, old_str, new_str)` — Apply a targeted single-file edit.\n"
+                "  - Use ONLY for simple changes: 1 file, <10 lines changed, straightforward fix.\n"
+                "- `escalate_to_edit_agent(task, reason)` — Hand off to Edit Agent.\n"
+                "  - Use when: 2+ files need changing, new files required, complex refactor.\n\n"
+                "**Rules:**\n"
+                "1. NEVER ask the user to share code — read files yourself.\n"
+                "2. For write requests: assess complexity first.\n"
+                "   - Simple (1 file, <10 lines): edit_file, then confirm what you changed.\n"
+                "   - Complex (multi-file, architectural): escalate_to_edit_agent immediately.\n"
+                "3. After reading files, answer directly without re-asking.\n"
             )
 
         lines.append(
@@ -570,6 +707,12 @@ def create_chat_engine(
         rag_integration=rag_integration,
         memory=memory,
     )
+
+
+def _chunk_string(text: str, size: int):
+    """Yield text in chunks of up to `size` chars (for simulating streaming)."""
+    for i in range(0, len(text), size):
+        yield text[i: i + size]
 
 
 __all__ = [

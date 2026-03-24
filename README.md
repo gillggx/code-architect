@@ -1,53 +1,82 @@
 # Code Architect Agent
 
-An AI-powered codebase analysis and agentic coding tool. Point it at any project directory — it reads your code with an LLM, builds a structured memory of the architecture, lets you chat about it in real time, and can execute code changes with planning and escalation safeguards.
+An AI-powered codebase analysis and agentic coding tool. Point it at any project directory — it reads your code, builds a structured **Architecture Map**, lets you chat about it with tool-use (the agent reads files on demand), and can execute code changes with planning and escalation safeguards.
 
-**Stack:** Python 3.13+ / FastAPI / React 18 / TypeScript / OpenRouter
+**Stack:** Python 3.13+ / FastAPI / React 18 / TypeScript / OpenRouter / lucide-react
+
+---
+
+## How It Works
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Analysis Phase                        │
+│  Scan files → LLM reads each → builds Architecture Map      │
+│  Map: {name, purpose, public_interface, full_path, symbols} │
+└────────────────────────┬────────────────────────────────────┘
+                         │  (stored in architect_memory/)
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   Chat Phase (Tool-Use)                      │
+│  User question → LLM inspects Map → picks relevant files    │
+│  → read_file(path) → answer grounded in actual code         │
+│                                                             │
+│  Simple edit → edit_file() directly in chat                 │
+│  Complex edit → escalate_to_edit_agent() → Edit Agent flow  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+The Architecture Map acts as a **directory** — the LLM checks it first to locate the right 1–3 files, then reads only those. Large projects stay fast and accurate without reading everything blindly.
 
 ---
 
 ## Features
 
 ### Analysis
-- **File scanning** — AST-level structure extraction (no LLM cost)
-- **LLM-powered reading** — builds structured memory of modules, patterns, dependencies
+- **File scanning** — AST-level structure extraction for Python/JS/TS (no LLM cost)
+- **LLM-powered reading** — builds a compact navigation map per file: `purpose`, `public_interface`, `dependencies`, `critical_path`, `edit_hints`
+- **Symbol extraction** — accurate function/class/method list with line numbers (via AST, not LLM)
 - **Incremental re-analysis** — only changed/new files are re-processed (MD5 + mtime snapshots)
-- **Chunked analysis** — large files are read in chunks with rolling memory accumulation; no timeout from oversized files
-- **Incremental persistence** — modules.json and SNAPSHOTS.json saved after every file so interrupted analyses are never lost
+- **Chunked analysis** — large files read in chunks with rolling memory; no timeouts from oversized files
+- **Incremental persistence** — `modules.json` and `SNAPSHOTS.json` saved after every file; interrupted analyses are never lost
 - **Memory consistency check** — auto-detects snapshot/module mismatch and triggers full re-analysis
 - **Real-time activity feed** — every file read and summary written shown live
 
-### Chat
-- **RAG-powered Q&A** — answers grounded in architecture memory via hybrid BM25 + vector search
-- **3-tier memory** — hot cache → Markdown summaries → vector embeddings
-- **Persistent memory display** — past analysis results loaded into Memory panel on project select
-- **Git context injection** — recent commits and uncommitted changes injected into chat so agent knows what was recently worked on
-- **Analysis-in-progress awareness** — chat agent warns when memory is incomplete during active analysis
+### Chat (Tool-Use Mode)
+- **Architecture Map context** — full module map injected into every chat so the LLM knows what exists
+- **JIT code retrieval** — LLM calls `read_file(path)` to read actual source before answering; never hallucinates from missing code
+- **Search across files** — `search_files(query)` greps the project on demand
+- **Inline edits** — `edit_file(path, old_str, new_str)` for simple single-file changes directly in chat
+- **Smart escalation** — complex/multi-file tasks automatically hand off to Edit Agent via `escalate_to_edit_agent()`; chat shows the transition inline and switches to Activity tab
+- **Audit queries** — "find all hardcoded values", "scan all files" automatically reads up to 8 source files
+- **Git context injection** — recent commits and uncommitted changes injected so agent knows what was recently touched
+- **Analysis-in-progress awareness** — warns when memory is incomplete during active analysis
+- **Conversation history** — last 10 turns kept per session for multi-turn dialogue
 
 ### Agentic Mode (Edit)
 - **SOUL.md** — per-project personality and constraints injected into agent system prompt
-- **Plan A / Plan B** — LLM generates execution plans with confidence scores; `response_format: json_object` ensures reliable JSON output across weak models
-- **Automatic task chunking** — large plans (>12 steps) split into phases automatically; each phase carries summary context from the previous
-- **Chat history injection** — recent chat conversation sent with edit tasks so agent understands context
+- **Plan A / Plan B** — LLM generates execution plans with confidence scores; reliable JSON output via `response_format: json_object`
+- **Automatic task chunking** — large plans (>12 steps) split into phases; each phase carries a summary from the previous
+- **Chat history injection** — recent chat conversation forwarded with edit tasks for context continuity
 - **Escalation Loop** — tool failure → auto-switch to Plan B → human escalation with custom instruction
 - **Built-in tools** — read/write/edit files, git status/diff, shell commands, code search
 - **Shell allowlist** — test runners, linters, git, find, ls, cat, grep; bypass with `AGENT_SHELL_UNRESTRICTED=true`
-- **50-iteration hard cap** — per phase, with stall detection: identical (tool, args) calls 3× in a row inject a forced-progress warning
+- **50-iteration hard cap** — per phase, with stall detection: same (tool, args) called 3× injects a forced-progress warning
 - **no-op guard** — `edit_file` rejects calls where `old_str == new_str` before touching disk
-- **Impact Preview** — before executing any edit task, calls `/api/a2a/impact` and shows predicted file changes with confidence bars; user confirms or cancels
-- **Git Checkpoint** — on first mutating tool call, creates `architect/task-{id}` branch; pre-task dirty tree saved as named stash; one-click Rollback in the UI restores original state
-- **Semantic Context Window** — recent files in the conversation are hydrated with their symbols and `imported_by` graph into a dynamic `## Active Context` block; conversation summaries injected when messages exceed 20
-- **Architecture Linter** — enforces `.architect-rules.yml` rules (forbidden/required imports per file glob) after every write; violations block continuation with auto-suggested memory alternatives
-- **Sticky Context** — after each successful edit, the module's `edit_hints` field is updated with a timestamped summary so future agent calls see what changed
-- **Task Briefing** — at the start of every task the agent emits a structured plan card listing all steps, confidence, and risk level; Activity Feed shows an animated "currently on step N" bar
+- **Impact Preview** — before executing, calls `/api/a2a/impact` and shows predicted file changes with confidence bars; user confirms or cancels
+- **Git Checkpoint** — on first mutating tool call, creates `architect/task-{id}` branch; pre-task dirty tree saved as named stash; one-click Rollback restores original state
+- **Semantic Context Window** — recently touched files hydrated with symbols and `imported_by` graph into a dynamic `## Active Context` block
+- **Architecture Linter** — enforces `.architect-rules.yml` after every write; violations block continuation with memory-based alternative suggestions
+- **Sticky Context** — after each successful edit, the module's `edit_hints` is updated with a timestamped summary so future calls see what changed
+- **Task Briefing** — structured plan card at task start with steps, confidence, and risk level; Activity Feed shows animated "currently on step N" bar
 
 ### Memory Panel
-- **Symbol navigation** — each module shows its functions/classes/variables; click any symbol to jump to that line in the file viewer
+- **Symbol navigation** — each module shows functions/classes/variables; click any symbol to jump to that line in the file viewer
 - **Used by N badge** — modules show how many other modules import them; N≥5 highlighted as a hot spot
-- **File context mode** — when a file is open in the editor, Memory Panel automatically focuses on that file's memory record with full symbols, edit hints, and patterns; toggle back to full list
+- **File context mode** — when a file is open in the editor, Memory Panel auto-focuses on that file's memory record
 
 ### A2A API
-- **Architecture query** — `POST /api/a2a/query` — other agents can ask architecture questions
+- **Architecture query** — `POST /api/a2a/query` — other agents can ask architecture questions; backed by project memory + JIT code reads
 - **Code generation** — `POST /api/a2a/generate` — SSE stream of agent events
 - **Validation** — `POST /api/a2a/validate`
 - **Impact analysis** — `POST /api/a2a/impact` — predicts which files a change will affect
@@ -62,10 +91,8 @@ An AI-powered codebase analysis and agentic coding tool. Point it at any project
 
 | Service | Port |
 |---------|------|
-| Backend (FastAPI) | **8765** |
+| Backend (FastAPI) | **8000** |
 | Frontend (Vite/React) | **3011** |
-
-Designed to run alongside [agent-platform](https://github.com/gillggx/agent-platform) (ports 8080/2999) on the same machine without conflicts.
 
 ---
 
@@ -89,7 +116,10 @@ cp .env.example .env   # then set OPENROUTER_API_KEY
 
 ```env
 OPENROUTER_API_KEY=sk-or-...
-DEFAULT_LLM_MODEL=anthropic/claude-haiku-4-5
+DEFAULT_LLM_MODEL=anthropic/claude-sonnet-4-5
+
+# Optional: cheaper model for bulk file analysis
+ANALYSIS_LLM_MODEL=google/gemini-2.0-flash-lite-001
 
 # Optional: bypass shell command allowlist (dev only)
 # AGENT_SHELL_UNRESTRICTED=true
@@ -102,8 +132,8 @@ DEFAULT_LLM_MODEL=anthropic/claude-haiku-4-5
 ```
 
 Opens:
-- Frontend: http://localhost:3001
-- API docs: http://localhost:8001/docs
+- Frontend: http://localhost:3011
+- API docs: http://localhost:8000/docs
 
 ---
 
@@ -118,10 +148,18 @@ code-architect/
 │   │   ├── diff.py           # Unified diff helpers
 │   │   ├── main.py           # FastAPI routes
 │   │   ├── schemas.py        # Pydantic request/response models
-│   │   └── tools/            # file_tools, shell_tools (allowlist), search_tools, git_tools
+│   │   └── tools/
+│   │       ├── chat_tools.py     # Chat tool-use: read_file, search_files, edit_file, escalate
+│   │       ├── file_tools.py     # Agent file I/O tools
+│   │       ├── shell_tools.py    # Shell execution with allowlist
+│   │       ├── search_tools.py   # Code search tools
+│   │       └── git_tools.py      # Git status/diff/checkpoint tools
 │   ├── analysis/             # LLM file analyzer (chunked), large project handler
 │   ├── codegen/              # Code generation helpers
-│   ├── llm/                  # LLM client, model router, chat engine (git context)
+│   ├── llm/
+│   │   ├── client.py         # LLM client — OpenRouter/custom/Ollama, streaming + tool-use
+│   │   ├── model_router.py   # Query complexity router (selects model per query)
+│   │   └── chat_engine.py    # Chat engine — Architecture Map + JIT retrieval + tool loop
 │   ├── memory/               # 3-tier memory (hot cache, markdown, vectors)
 │   ├── patterns/             # Design pattern detector
 │   ├── projects/             # Project manager
@@ -129,17 +167,33 @@ code-architect/
 ├── web/src/
 │   ├── components/
 │   │   ├── AgentActivityFeed.tsx  # Activity/Chat/File/Graph tabs + briefing card + step bar
-│   │   ├── ChatBar.tsx            # Chat/Edit mode input + Impact Preview modal
+│   │   ├── ChatBar.tsx            # Chat/Edit mode + tool-use event rendering + auto-escalation
 │   │   ├── MemoryPanel.tsx        # Module list + symbol navigation + used-by badge
 │   │   ├── PlanCard.tsx           # Plan A/B approval card
 │   │   ├── EscalationCard.tsx     # Tool failure escalation UI
-│   │   ├── TopBar.tsx             # Project selector + rollback button + freshness indicator
+│   │   ├── TopBar.tsx             # Project selector + rollback + freshness indicator
+│   │   ├── FileTree.tsx           # File tree with analysis status
 │   │   └── FileEditor.tsx         # In-panel file viewer (click-to-line)
 │   └── store/app.ts               # Zustand state (projects, memory, chat, agent session)
-├── master_prd_sprint3_sprint4.md  # Sprint 3-4 feature spec
 ├── start.sh                       # One-command start
 └── .env                           # API keys and model selection
 ```
+
+---
+
+## Chat Tool-Use SSE Events
+
+When chatting with a project loaded, `/api/chat` streams these event types:
+
+| Event | Description |
+|-------|-------------|
+| `chunk` | Text chunk of the final answer |
+| `tool_thinking` | LLM calling a tool (shown as blockquote in chat bubble) |
+| `tool_result` | Tool result consumed by LLM (not displayed to user) |
+| `tool_edit` | A file was edited inline during chat |
+| `escalate` | Task handed off to Edit Agent (auto-launches agent flow) |
+| `done` | Stream complete |
+| `error` | Stream error |
 
 ---
 
@@ -164,8 +218,6 @@ rules:
       - "logging"
 ```
 
-When a violation is detected, the agent also searches project memory for a suitable alternative module (e.g. a `*service*` or `*facade*` file that wraps the forbidden resource) and suggests it alongside the violation message.
-
 ---
 
 ## SOUL.md
@@ -188,12 +240,12 @@ You are a careful, security-focused architect.
 
 ## A2A Integration
 
-Base URL: `http://127.0.0.1:8765`
+Base URL: `http://127.0.0.1:8000`
 
-### Scenario A — Query an existing project
+### Query an existing project
 
 ```bash
-curl -X POST http://localhost:8765/api/a2a/query \
+curl -X POST http://localhost:8000/api/a2a/query \
   -H "Content-Type: application/json" \
   -d '{"question": "How does authentication work?", "project_id": "my-project", "query_type": "architecture"}'
 ```
@@ -205,13 +257,11 @@ Response:
   "confidence": 0.87,
   "sources": ["src/auth/middleware.py", "src/auth/jwt.py"],
   "patterns_relevant": ["middleware", "JWT"],
-  "model_used": "anthropic/claude-haiku-4-5"
+  "model_used": "anthropic/claude-sonnet-4-5"
 }
 ```
 
-### Scenario B — Edit an existing project
-
-The edit agent accepts `chat_history` for context and requires memory to exist first:
+### Edit an existing project
 
 ```json
 {
@@ -225,26 +275,24 @@ The edit agent accepts `chat_history` for context and requires memory to exist f
 }
 ```
 
-If the project has no architecture memory, `POST /api/a2a/generate` returns **HTTP 428** with remediation steps:
+If no architecture memory exists, `POST /api/a2a/generate` returns **HTTP 428**:
 
 ```json
 {
   "error": "project_memory_empty",
-  "message": "Project has no architecture memory...",
   "remediation": {
     "step_1": { "description": "Trigger analysis", "method": "POST", "path": "/api/analyze" },
     "step_2": { "description": "Poll for completion", "method": "GET", "path": "/api/projects/{id}/freshness" },
     "step_3": { "description": "Retry generate", "method": "POST", "path": "/api/a2a/generate" }
-  },
-  "tip": "Set force_generate=true to bypass if task has explicit implementation details."
+  }
 }
 ```
 
-### Scenario C — Create a new project from scratch
+### Create a new project from scratch
 
 ```bash
-# 1. Scaffold the project
-curl -X POST http://localhost:8765/api/a2a/scaffold \
+# 1. Scaffold
+curl -X POST http://localhost:8000/api/a2a/scaffold \
   -H "Content-Type: application/json" \
   -d '{
     "project_path": "/path/to/my-service",
@@ -253,17 +301,12 @@ curl -X POST http://localhost:8765/api/a2a/scaffold \
     "options": {"git_init": true, "auto_analyze": true}
   }'
 
-# 2. Wait for analysis (poll freshness)
-curl http://localhost:8765/api/projects/{project_id}/freshness
+# 2. Wait for analysis
+curl http://localhost:8000/api/projects/{project_id}/freshness
 
-# 3. Generate code (now memory exists)
-curl -X POST http://localhost:8765/api/a2a/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "task": "Implement POST /items with validation and persistence",
-    "project_id": "{project_id}",
-    "mode": "apply"
-  }'
+# 3. Generate
+curl -X POST http://localhost:8000/api/a2a/generate \
+  -d '{"task": "Implement POST /items", "project_id": "{project_id}", "mode": "apply"}'
 ```
 
 Available templates: `fastapi-minimal`, `fastapi-full`, `python-lib`, `agent`
@@ -278,5 +321,6 @@ Available templates: `fastapi-minimal`, `fastapi-full`, `python-lib`, `agent`
 | `DEFAULT_LLM_MODEL` | `google/gemini-2.5-flash-lite` | Model for chat and edit agent |
 | `ANALYSIS_LLM_MODEL` | `google/gemini-2.0-flash-lite-001` | Model for bulk file analysis (cheaper) |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter endpoint |
+| `CUSTOM_LLM_BASE_URL` | — | Corporate/on-prem OpenAI-compatible endpoint |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama fallback (used only if no API key) |
 | `AGENT_SHELL_UNRESTRICTED` | `false` | Bypass shell command allowlist (dev only) |

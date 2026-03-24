@@ -55,6 +55,19 @@ const ImpactPreviewModal: React.FC<ImpactPreviewModalProps> = ({ files, loading,
   </div>
 );
 
+// ---------------------------------------------------------------------------
+// Tool event helpers
+// ---------------------------------------------------------------------------
+
+function toolThinkingLabel(tool: string, args: Record<string, unknown>): string {
+  switch (tool) {
+    case 'read_file':    return `Reading \`${args.path ?? ''}\``;
+    case 'search_files': return `Searching \`${args.query ?? ''}\``;
+    case 'edit_file':    return `Editing \`${args.path ?? ''}\``;
+    default: return tool;
+  }
+}
+
 const ChatBar: React.FC = () => {
   const { addChatMessage, updateLastAssistantMessage, isChatStreaming, setChatStreaming, chatMessages } = useChat();
   const { selectedProject } = useUI();
@@ -105,6 +118,8 @@ const ChatBar: React.FC = () => {
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
+    let escalationTask: string | null = null;
+
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -125,7 +140,7 @@ const ChatBar: React.FC = () => {
       const decoder = new TextDecoder();
       let buffer = '';
 
-      while (true) {
+      outer: while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
@@ -135,10 +150,61 @@ const ChatBar: React.FC = () => {
           const trimmed = line.trim();
           if (!trimmed.startsWith('data:')) continue;
           const raw = trimmed.slice(5).trim();
-          if (raw === '[DONE]') break;
+          if (raw === '[DONE]') break outer;
           try {
-            const parsed = JSON.parse(raw) as { type?: string; data?: string; delta?: string; text?: string; content?: string };
-            if (parsed.type === 'done') break;
+            const parsed = JSON.parse(raw) as {
+              type?: string;
+              data?: string;
+              delta?: string;
+              text?: string;
+              content?: string;
+              tool?: string;
+              args?: Record<string, unknown>;
+              result?: string;
+              path?: string;
+              diff?: string;
+              task?: string;
+              reason?: string;
+            };
+
+            if (parsed.type === 'done') break outer;
+
+            if (parsed.type === 'chunk') {
+              const chunk = parsed.data ?? parsed.delta ?? parsed.text ?? parsed.content ?? '';
+              if (chunk) updateLastAssistantMessage(chunk);
+              continue;
+            }
+
+            if (parsed.type === 'tool_thinking' && parsed.tool) {
+              const label = toolThinkingLabel(parsed.tool, parsed.args ?? {});
+              updateLastAssistantMessage(`\n\n> *${label}...*\n\n`);
+              continue;
+            }
+
+            if (parsed.type === 'tool_edit' && parsed.path) {
+              updateLastAssistantMessage(`\n\n> *Edited \`${parsed.path}\`*\n\n`);
+              continue;
+            }
+
+            if (parsed.type === 'tool_result') {
+              // Skip — tool results are for the LLM context, not chat display
+              continue;
+            }
+
+            if (parsed.type === 'escalate' && parsed.task) {
+              updateLastAssistantMessage(
+                `\n\n---\n*This task requires multi-file changes. Escalating to Edit Agent...*\n`
+              );
+              escalationTask = parsed.task;
+              break outer;
+            }
+
+            if (parsed.type === 'error') {
+              updateLastAssistantMessage(`\n\n[Error: ${parsed.data ?? 'unknown'}]`);
+              break outer;
+            }
+
+            // Fallback: legacy plain chunk
             const chunk = parsed.data ?? parsed.delta ?? parsed.text ?? parsed.content ?? '';
             if (chunk) updateLastAssistantMessage(chunk);
           } catch {
@@ -148,9 +214,15 @@ const ChatBar: React.FC = () => {
       }
     } catch (err) {
       if ((err as Error).name !== 'AbortError') updateLastAssistantMessage('[Connection error]');
+      escalationTask = null; // Don't escalate on error
     } finally {
       setChatStreaming(false);
       abortRef.current = null;
+    }
+
+    // Auto-escalate: hand off to Edit Agent after chat mode escalation
+    if (escalationTask) {
+      runEditAgent(escalationTask);
     }
   };
 

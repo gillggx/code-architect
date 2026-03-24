@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Optional, Any
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,94 @@ class LLMClient:
         else:
             async for chunk in self._stream_ollama(messages, chosen_model):
                 yield chunk
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        model: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Non-streaming completion with tool support (function calling).
+
+        Returns a message dict that may contain:
+          {"role": "assistant", "content": "..."}               — plain text reply
+          {"role": "assistant", "content": None, "tool_calls": [...]}  — tool invocation
+
+        Falls back to plain completion for backends that don't support tool use (Ollama).
+        """
+        chosen_model = model or self.model
+
+        if self._use_openrouter:
+            return await self._complete_tools_openai(
+                messages, tools, chosen_model,
+                api_key=self._api_key,
+                base_url=OPENROUTER_BASE_URL,
+                extra_headers={
+                    "HTTP-Referer": "https://github.com/code-architect-agent",
+                    "X-Title": "Code Architect Agent",
+                },
+            )
+        elif self._use_custom:
+            return await self._complete_tools_openai(
+                messages, tools, chosen_model,
+                api_key=CUSTOM_LLM_API_KEY,
+                base_url=CUSTOM_LLM_BASE_URL,
+            )
+        else:
+            # Ollama has limited tool support — fall back to plain completion
+            logger.warning("complete_with_tools: Ollama fallback (no tool support)")
+            text = await self.complete(messages, model=chosen_model)
+            return {"role": "assistant", "content": text}
+
+    async def _complete_tools_openai(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        model: str,
+        api_key: str,
+        base_url: str,
+        extra_headers: Optional[dict] = None,
+    ) -> dict[str, Any]:
+        try:
+            from openai import AsyncOpenAI
+        except ImportError:
+            logger.error("openai package not installed")
+            return {"role": "assistant", "content": "[Error: openai package missing]"}
+
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+        kwargs: dict[str, Any] = dict(
+            model=model,
+            messages=messages,  # type: ignore[arg-type]
+            tools=tools,  # type: ignore[arg-type]
+            tool_choice="auto",
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
+
+        try:
+            response = await client.chat.completions.create(**kwargs)
+            msg = response.choices[0].message
+            result: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
+            if msg.tool_calls:
+                result["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ]
+            return result
+        except Exception as exc:
+            logger.error("complete_with_tools error: %s", exc)
+            return {"role": "assistant", "content": f"[LLM Error: {exc}]"}
 
     async def complete(
         self,

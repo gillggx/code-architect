@@ -1180,6 +1180,18 @@ def create_app(debug: bool = False) -> FastAPI:
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     return
 
+                # Tool-use mode when project_path is available
+                if project_path:
+                    async for evt in _app_state.chat_engine.stream_chat_v2(
+                        session, request.message,
+                        project_path=project_path,
+                        analysis_status=analysis_status,
+                        recent_changes=recent_changes,
+                    ):
+                        yield f"data: {json.dumps(evt)}\n\n"
+                    return
+
+                # Fallback: plain streaming (no project loaded)
                 async for chunk in _app_state.chat_engine.stream_chat(
                     session, request.message,
                     analysis_status=analysis_status,

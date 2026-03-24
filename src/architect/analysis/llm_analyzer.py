@@ -625,7 +625,7 @@ class LLMAnalyzer:
             file=file_path,
         ))
 
-        memory: dict = {"purpose": "", "key_components": [], "dependencies": [], "patterns": [], "edit_hints": ""}
+        memory: dict = {"purpose": "", "public_interface": [], "dependencies": [], "critical_path": False, "edit_hints": ""}
         raw_response = ""
 
         for chunk_index, chunk in enumerate(chunks, start=1):
@@ -660,9 +660,11 @@ class LLMAnalyzer:
                 parsed = self._parse_llm_response(raw_response)
                 if parsed.get("purpose"):
                     memory["purpose"] = parsed["purpose"]
+                if parsed.get("critical_path"):
+                    memory["critical_path"] = parsed["critical_path"]
                 if parsed.get("edit_hints") and not memory["edit_hints"]:
                     memory["edit_hints"] = parsed["edit_hints"]
-                for key in ("key_components", "dependencies", "patterns"):
+                for key in ("public_interface", "dependencies"):
                     existing = memory.get(key, [])
                     new_items = parsed.get(key, [])
                     if isinstance(new_items, list):
@@ -725,9 +727,9 @@ class LLMAnalyzer:
             "path": rel_path,
             "full_path": file_path,
             "purpose": purpose,
-            "key_components": summary_data.get("key_components", []),
+            "public_interface": summary_data.get("public_interface", []),
             "dependencies": summary_data.get("dependencies", []),
-            "patterns": patterns,
+            "critical_path": bool(summary_data.get("critical_path", False)),
             "edit_hints": summary_data.get("edit_hints", "") or summary_data.get("notes", ""),
             "symbols": symbols,
             "imported_by": [],   # populated in post-processing pass
@@ -742,31 +744,20 @@ class LLMAnalyzer:
     # ------------------------------------------------------------------
 
     def _build_file_prompt(self, file_path: str, content: str) -> str:
-        """Build the contract-oriented analysis prompt for a single file."""
+        """Build the navigation-map analysis prompt for a single file."""
         language = self._detect_language(file_path)
         return (
             f"You are a senior architect building a navigation map for a {language} file. "
-            "Your goal is NOT to summarize — it is to extract a precise CONTRACT that lets "
-            "another agent answer questions WITHOUT reading the source code.\n\n"
-            "Return JSON with these keys:\n"
-            "- purpose: 1 sentence — what business problem this file solves\n"
-            "- key_components: list of class/function names exported or defined\n"
-            "- dependencies: list of imports/requires\n"
-            "- patterns: list of design patterns spotted\n"
-            "- edit_hints: 1 sentence — the most important gotcha when modifying this file\n"
-            "- public_interface: list of exported function signatures with param types and return type "
+            "Your goal is to produce a compact index that lets an AI agent quickly find the right file "
+            "and understand its role — the agent can always read source code directly for details.\n\n"
+            "Return JSON with ONLY these keys:\n"
+            "- purpose: 1 sentence — what this file does\n"
+            "- public_interface: list of exported function signatures "
             "(e.g. ['verify_token(token: str) -> User', 'create_token(user_id: int) -> str'])\n"
-            "- pre_conditions: list of conditions that must be true before calling this module "
-            "(e.g. ['user must be authenticated', 'SECRET_KEY env var must be set']). Empty list if none.\n"
-            "- side_effects: list of observable effects beyond return value "
-            "(e.g. ['writes to DB', 'sends email', 'modifies global state']). Empty list if none.\n"
-            "- critical_path: true if this file is on a core business flow (payment, auth, data integrity), "
-            "false otherwise\n"
-            "- business_rule: 1 sentence — the key business logic or invariant this file enforces. "
-            "'none' if purely infrastructure.\n"
-            "- fragile_points: list of things most likely to break when this file changes "
-            "(e.g. ['callers that expect synchronous return', 'hardcoded timeout in line 42']). "
-            "Empty list if none.\n\n"
+            "- dependencies: list of internal imports (not stdlib/third-party)\n"
+            "- critical_path: true if this file is on a core business flow (auth, payment, data integrity)\n"
+            "- edit_hints: 1 sentence — the single most important gotcha when modifying this file. "
+            "'none' if unremarkable.\n\n"
             f"File: {file_path}\n\n{content}"
         )
 
@@ -795,17 +786,13 @@ class LLMAnalyzer:
         )
 
         return (
-            f"You are incrementally building a navigation contract for a large {language} file ({file_path}). "
+            f"You are incrementally building a navigation map for a large {language} file ({file_path}). "
             f"This is chunk {chunk_index}/{total_chunks}.\n"
             f"{memory_str}\n"
             f"Chunk content:\n{chunk}\n\n"
-            "Return JSON with keys: purpose, key_components, dependencies, patterns, edit_hints, "
-            "public_interface (list of exported function signatures with types), "
-            "pre_conditions (list of required conditions before use — empty list if none), "
-            "side_effects (list of DB writes / external calls / state mutations — empty list if none), "
-            "critical_path (true/false), "
-            "business_rule (key invariant enforced, or 'none'), "
-            "fragile_points (list of likely breakage points — empty list if none). "
+            "Return JSON with keys: purpose, public_interface (list of exported function signatures with types), "
+            "dependencies (internal imports only), critical_path (true/false), "
+            "edit_hints (most important gotcha or 'none'). "
             f"{instruction}"
         )
 
