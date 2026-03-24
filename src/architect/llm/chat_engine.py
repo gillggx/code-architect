@@ -46,7 +46,9 @@ _MAP_ONLY_PATTERNS = re.compile(
 
 _FULL_CONTEXT_PATTERNS = re.compile(
     r"(整個流程|entire flow|end.to.end|從頭到尾|all files|所有檔案|"
-    r"跨.*模組|across.*module|system.wide|全系統)",
+    r"跨.*模組|across.*module|system.wide|全系統|"
+    r"hardcode|hard.code|magic.number|hard.coded|寫死|硬編碼|"
+    r"audit|scan all|grep.*all|列出所有|找出所有|有多少)",
     re.IGNORECASE,
 )
 
@@ -214,7 +216,7 @@ class ChatEngine:
 
         # Phase 3: JIT code retrieval — locate relevant symbols then read only those lines
         if route in ("MAP_THEN_JIT", "FULL_CONTEXT") and project_id:
-            context["jit_snippets"] = self._jit_retrieve(query, project_id)
+            context["jit_snippets"] = self._jit_retrieve(query, project_id, route=route)
 
         if not self.rag and not self.memory:
             return context
@@ -272,36 +274,68 @@ class ChatEngine:
 
         return messages
 
-    def _jit_retrieve(self, query: str, project_id: str) -> List[Dict[str, Any]]:
+    def _jit_retrieve(self, query: str, project_id: str, route: str = "MAP_THEN_JIT") -> List[Dict[str, Any]]:
         """
         Phase 3 — JIT Code Retrieval.
         Use the contract map to locate relevant symbols, then read only those
         lines from disk. Returns a list of {file, symbol, lines, code} dicts.
+
+        Priority: full_path > path (full_path is absolute, path may be relative).
         """
         modules = self._project_modules.get(project_id, [])
         if not modules:
             return []
 
         query_lower = query.lower()
+        query_words = set(re.findall(r'\w+', query_lower))
         snippets: List[Dict[str, Any]] = []
 
+        # FULL_CONTEXT or audit-style queries ("audit", "hardcode", "all files") —
+        # scan all source files instead of trying to match keywords
+        is_audit = route == "FULL_CONTEXT" or bool(re.search(
+            r'(hardcode|hard.code|magic.number|literal|audit|所有檔案|全部|scan all|grep)',
+            query_lower,
+        ))
+        max_snippets = 8 if is_audit else 4
+
+        scored: List[tuple[int, dict]] = []
         for mod in modules:
-            path = mod.get("path", "")
+            # Prefer absolute full_path; fall back to relative path
+            path = mod.get("full_path") or mod.get("path", "")
             if not path or not os.path.isfile(path):
                 continue
 
-            symbols = mod.get("symbols", [])
-            # Score: does query mention this module's name or any symbol name?
-            mod_name = (mod.get("name") or "").lower()
-            public_iface = " ".join(mod.get("public_interface", [])).lower()
-            combined = f"{mod_name} {public_iface} {mod.get('purpose','').lower()}"
-
-            # Simple keyword match — if query terms hit this module
-            query_words = set(re.findall(r'\w+', query_lower))
-            mod_words = set(re.findall(r'\w+', combined))
-            overlap = query_words & mod_words
-            if len(overlap) < 2 and mod_name not in query_lower:
+            # Skip non-source files for audit scans (skip docs, configs)
+            ext = os.path.splitext(path)[1].lower()
+            if is_audit and ext in ('.md', '.json', '.yml', '.yaml', '.toml', '.txt', '.lock'):
                 continue
+
+            mod_name = (mod.get("name") or "").lower()
+            # Build a rich searchable string from all module fields
+            combined = " ".join(filter(None, [
+                mod_name,
+                mod.get("purpose", ""),
+                " ".join(mod.get("public_interface", [])),
+                " ".join(mod.get("key_components", [])),
+                mod.get("business_rule", ""),
+            ])).lower()
+
+            if is_audit:
+                score = 1  # include everything for audit queries
+            else:
+                mod_words = set(re.findall(r'\w+', combined))
+                overlap = query_words & mod_words
+                score = len(overlap) + (5 if mod_name in query_lower else 0)
+                if score == 0:
+                    continue
+
+            scored.append((score, mod, path))  # type: ignore[arg-type]
+
+        # Sort by score descending
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        for score, mod, path in scored:  # type: ignore[misc]
+            symbols = mod.get("symbols", [])
 
             # Find matching symbol by name
             matched_syms = [
@@ -309,11 +343,11 @@ class ChatEngine:
                 if s.get("name", "").lower() in query_lower
             ]
 
-            if matched_syms:
+            if matched_syms and not is_audit:
                 # Read only the matching function/class lines
                 for sym in matched_syms[:2]:
                     start = max(0, sym.get("line_start", 1) - 1)
-                    end = sym.get("line_end", start + 30)
+                    end = sym.get("line_end", start + 40)
                     code = self._read_lines(path, start, end)
                     if code:
                         snippets.append({
@@ -323,17 +357,18 @@ class ChatEngine:
                             "code": code,
                         })
             else:
-                # No specific symbol matched — read first 40 lines as overview
-                code = self._read_lines(path, 0, 40)
+                # Read first 60 lines (enough to spot hardcoded values)
+                read_lines = 80 if is_audit else 50
+                code = self._read_lines(path, 0, read_lines)
                 if code:
                     snippets.append({
                         "file": path,
                         "symbol": None,
-                        "lines": "1-40",
+                        "lines": f"1-{read_lines}",
                         "code": code,
                     })
 
-            if len(snippets) >= 3:
+            if len(snippets) >= max_snippets:
                 break
 
         return snippets
@@ -471,12 +506,24 @@ class ChatEngine:
         # Phase 3: inject JIT code snippets
         jit_snippets = context.get("jit_snippets", [])
         if jit_snippets:
-            lines.append("## Relevant Code (read just-in-time for this query)")
+            lines.append(
+                "## Source Code (read directly from disk for this query)\n"
+                "**IMPORTANT: Answer the question by analyzing the actual code below.**\n"
+                "Do NOT ask the user to provide code — you already have it.\n"
+            )
             for s in jit_snippets:
                 sym_label = f" — `{s['symbol']}`" if s.get("symbol") else ""
                 lines.append(f"\n### {s['file']}{sym_label} (lines {s['lines']})")
                 lines.append(f"```\n{s['code'].strip()}\n```")
             lines.append("")
+        elif route in ("MAP_THEN_JIT", "FULL_CONTEXT") and modules:
+            # JIT retrieval ran but found nothing readable — tell LLM explicitly
+            lines.append(
+                "## Note on Source Code\n"
+                "Source files could not be read for this query (files may have moved or be inaccessible). "
+                "Answer from the architecture map above. If you cannot answer without code, say so clearly "
+                "and tell the user which specific file(s) to share.\n"
+            )
 
         if not semantic and not patterns and not kw_hits and not modules:
             lines.append(
