@@ -243,11 +243,23 @@ const ChatBar: React.FC = () => {
     setImpactLoading(true);
     setImpactFiles([]);
     setShowImpactModal(true);
+
+    // Send recent chat history so impact API understands context references
+    const historyForImpact = chatMessages
+      .filter(m => !m.streaming && m.content)
+      .slice(-8)
+      .map(m => ({ role: m.role, content: m.content }));
+
     try {
       const res = await fetch('/api/a2a/impact', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_id: selectedProject.id, files: [], change_description: text }),
+        body: JSON.stringify({
+          project_id: selectedProject.id,
+          files: [],
+          change_description: text,
+          chat_history: historyForImpact,
+        }),
       });
       if (res.ok) {
         const data = await res.json() as { affected_files?: ImpactFile[] };

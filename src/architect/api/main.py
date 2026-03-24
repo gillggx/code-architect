@@ -1394,6 +1394,7 @@ def create_app(debug: bool = False) -> FastAPI:
                 chat_history=request.chat_history or [],
                 shell_unrestricted=request.shell_unrestricted,
                 auto_approve=request.auto_approve,
+                clarification_answers=request.clarification_answers or {},
             )
 
             async def sse_stream():
@@ -1418,6 +1419,7 @@ def create_app(debug: bool = False) -> FastAPI:
             chat_history=request.chat_history or [],
             shell_unrestricted=request.shell_unrestricted,
             auto_approve=request.auto_approve,
+            clarification_answers=request.clarification_answers or {},
         )
 
         explanation = ""
@@ -1513,15 +1515,36 @@ def create_app(debug: bool = False) -> FastAPI:
         session_id = f"impact-{request.project_id}-{uuid4()}"
         session = get_or_create_session(session_id, request.project_id)
 
-        files_str = ", ".join(request.files)
+        files_str = ", ".join(request.files) or "not specified"
+
+        # Inject recent chat history so the LLM understands context references
+        # e.g. "implement those 5 improvements" → need the prior assistant message
+        chat_context = ""
+        if request.chat_history:
+            recent = request.chat_history[-5:]
+            lines = [f"  {m['role'].upper()}: {m['content'][:400]}" for m in recent]
+            chat_context = "\nRecent conversation:\n" + "\n".join(lines) + "\n"
+
+        # Module map for grounded file references
+        module_map = ""
+        if project_modules:
+            lines = [
+                f"  - {m.get('name','?')}: {m.get('purpose','')}"
+                for m in project_modules[:20]
+            ]
+            module_map = "\nProject modules:\n" + "\n".join(lines) + "\n"
+
         prompt = (
-            f"Analyse the impact of the following change on the project:\n\n"
-            f"Change: {request.change_description}\n"
-            f"Files being modified: {files_str}\n\n"
-            "List other files likely to be affected, explain the risk (low/medium/high), "
-            "and give a recommendation.\n\n"
-            "Respond in JSON: {affected_files: [{file, reason, risk}], "
-            "risk: 'low'|'medium'|'high', confidence: 0-1, recommendation: str}"
+            f"Analyse the impact of the following change on the project.\n"
+            f"{chat_context}"
+            f"Change requested: {request.change_description}\n"
+            f"Files directly modified: {files_str}\n"
+            f"{module_map}\n"
+            "Based on the conversation context and project modules above, "
+            "list the specific project files most likely to be affected. "
+            "Reference actual module names from the project, not generic descriptions.\n\n"
+            "Respond in JSON: {\"affected_files\": [{\"file\": \"path/to/file\", \"reason\": \"why\", \"confidence\": 0.0-1.0}], "
+            "\"risk\": \"low\"|\"medium\"|\"high\", \"confidence\": 0.0-1.0, \"recommendation\": \"string\"}"
         )
 
         answer = await _app_state.chat_engine.complete_chat(session, prompt)
@@ -1758,6 +1781,8 @@ def create_app(debug: bool = False) -> FastAPI:
         if sess is None:
             raise HTTPException(status_code=404, detail=f"Session '{request.session_id}' not found.")
         sess.plan_approved_action = request.action
+        if request.clarification_answers:
+            sess.clarification_answers = request.clarification_answers
         sess.plan_approval_event.set()
         return {"ok": True, "session_id": request.session_id, "action": request.action}
 

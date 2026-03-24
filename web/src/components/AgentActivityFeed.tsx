@@ -12,7 +12,7 @@ import {
   FolderOpen, Code2, Bot, CheckCircle, Database, Tag, Minus,
   CheckCircle2, XCircle, Wrench, ArrowUpFromLine, Clock,
   MessageSquare, ClipboardList, AlertTriangle, KeyRound,
-  Activity, Network, Pencil, ChevronRight,
+  Activity, Network, Pencil, ChevronRight, HelpCircle,
   type LucideIcon,
 } from 'lucide-react';
 import { useAgentEvents, useChat, useAppStore, AgentEvent, ChatMessage } from '../store/app';
@@ -41,8 +41,9 @@ const EVENT_META: Partial<Record<AgentEvent['type'], EventMeta>> = {
   approval_required: { Icon: Clock,            label: 'Approval',   color: '#e67e22', bold: true },
   message:           { Icon: MessageSquare,    label: 'Message',    color: '#555' },
   plan:              { Icon: ClipboardList,    label: 'Plan',       color: '#8e44ad', bold: true },
-  escalation:        { Icon: AlertTriangle,    label: 'Escalation', color: '#c0392b', bold: true },
-  session:           { Icon: KeyRound,         label: 'Session',    color: '#888' },
+  escalation:           { Icon: AlertTriangle,  label: 'Escalation',     color: '#c0392b', bold: true },
+  clarification_needed: { Icon: HelpCircle,    label: 'Clarification',  color: '#e67e22', bold: true },
+  session:              { Icon: KeyRound,       label: 'Session',        color: '#888' },
 };
 
 function fmtTime(d: Date): string { return d.toTimeString().slice(0, 8); }
@@ -62,6 +63,92 @@ const DiffViewer: React.FC<{ diff: string }> = ({ diff }) => {
         return <span key={i} className={cls}>{line}{'\n'}</span>;
       })}
     </pre>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Clarification card
+// ---------------------------------------------------------------------------
+const ClarificationCard: React.FC<{ event: AgentEvent }> = ({ event }) => {
+  const agentSession = useAppStore(s => s.agentSession);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [submitted, setSubmitted] = useState(false);
+
+  let questions: string[] = [];
+  let task = '';
+  try {
+    const data = JSON.parse(event.content ?? '{}');
+    questions = data.questions ?? [];
+    task = data.task ?? '';
+  } catch { /* ignore */ }
+
+  const allAnswered = questions.length > 0 && questions.every(q => (answers[q] ?? '').trim().length > 0);
+
+  const handleSubmit = async () => {
+    const sessionId = agentSession ?? '';
+    if (!sessionId) return;
+    try {
+      // Send answers through plan-approve mechanism, carrying clarification_answers
+      await fetch('/api/agent/approve-plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          action: 'approve',
+          clarification_answers: answers,
+        }),
+      });
+      setSubmitted(true);
+    } catch (err) {
+      console.error('Clarification submit failed:', err);
+    }
+  };
+
+  const handleSkip = async () => {
+    const sessionId = agentSession ?? '';
+    if (!sessionId) return;
+    await fetch('/api/agent/approve-plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, action: 'approve', clarification_answers: {} }),
+    });
+    setSubmitted(true);
+  };
+
+  if (submitted) {
+    return <div className="clarification-card resolved"><span>Clarification submitted — generating plan...</span></div>;
+  }
+
+  return (
+    <div className="clarification-card">
+      <div className="clarification-header">
+        Before generating a plan, the agent needs a few clarifications:
+      </div>
+      {task && <div className="clarification-task">Task: <em>{task.slice(0, 120)}{task.length > 120 ? '…' : ''}</em></div>}
+      <div className="clarification-questions">
+        {questions.map((q, i) => (
+          <div key={i} className="clarification-question">
+            <label className="clarification-q-label">{i + 1}. {q}</label>
+            <input
+              className="clarification-input"
+              type="text"
+              placeholder="Your answer..."
+              value={answers[q] ?? ''}
+              onChange={e => setAnswers(prev => ({ ...prev, [q]: e.target.value }))}
+              onKeyDown={e => { if (e.key === 'Enter' && allAnswered) handleSubmit(); }}
+            />
+          </div>
+        ))}
+      </div>
+      <div className="clarification-actions">
+        <button className="clarification-btn primary" onClick={handleSubmit} disabled={!allAnswered}>
+          Submit &amp; Plan
+        </button>
+        <button className="clarification-btn" onClick={handleSkip}>
+          Skip — proceed anyway
+        </button>
+      </div>
+    </div>
   );
 };
 
@@ -251,6 +338,20 @@ const EventRow: React.FC<{ event: AgentEvent }> = ({ event }) => {
           {meta.label}
         </span>
         <EscalationCard event={event} />
+      </div>
+    );
+  }
+
+  // Special rendering for clarification_needed events
+  if (event.type === 'clarification_needed') {
+    return (
+      <div className="event-row event-row-clarification">
+        <span className="event-time">{fmtTime(event.timestamp)}</span>
+        <span className="event-icon"><meta.Icon size={13} color={meta.color} /></span>
+        <span className="event-label" style={{ color: meta.color, fontWeight: 700 }}>
+          {meta.label}
+        </span>
+        <ClarificationCard event={event} />
       </div>
     );
   }

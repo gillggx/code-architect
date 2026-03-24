@@ -38,6 +38,7 @@ export interface AgentEvent {
     | 'message'
     | 'plan'
     | 'escalation'
+    | 'clarification_needed'
     | 'session';
   message: string;
   file?: string;

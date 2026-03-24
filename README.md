@@ -55,7 +55,8 @@ The Architecture Map acts as a **directory** — the LLM checks it first to loca
 
 ### Agentic Mode (Edit)
 - **SOUL.md** — per-project personality and constraints injected into agent system prompt
-- **Plan A / Plan B** — LLM generates execution plans with confidence scores; reliable JSON output via `response_format: json_object`
+- **Clarity Assessment** — before planning, LLM evaluates whether the task is specific enough; if unclear, shows a **ClarificationCard** with targeted questions; user answers → agent proceeds with full context
+- **Plan A / Plan B** — LLM generates execution plans grounded in chat history; reliable JSON output via `response_format: json_object`
 - **Automatic task chunking** — large plans (>12 steps) split into phases; each phase carries a summary from the previous
 - **Chat history injection** — recent chat conversation forwarded with edit tasks for context continuity
 - **Escalation Loop** — tool failure → auto-switch to Plan B → human escalation with custom instruction
@@ -63,7 +64,7 @@ The Architecture Map acts as a **directory** — the LLM checks it first to loca
 - **Shell allowlist** — test runners, linters, git, find, ls, cat, grep; bypass with `AGENT_SHELL_UNRESTRICTED=true`
 - **50-iteration hard cap** — per phase, with stall detection: same (tool, args) called 3× injects a forced-progress warning
 - **no-op guard** — `edit_file` rejects calls where `old_str == new_str` before touching disk
-- **Impact Preview** — before executing, calls `/api/a2a/impact` and shows predicted file changes with confidence bars; user confirms or cancels
+- **Impact Preview** — before executing, calls `/api/a2a/impact` with chat history context and shows predicted file changes referencing actual project modules; user confirms or cancels
 - **Git Checkpoint** — on first mutating tool call, creates `architect/task-{id}` branch; pre-task dirty tree saved as named stash; one-click Rollback restores original state
 - **Semantic Context Window** — recently touched files hydrated with symbols and `imported_by` graph into a dynamic `## Active Context` block
 - **Architecture Linter** — enforces `.architect-rules.yml` after every write; violations block continuation with memory-based alternative suggestions

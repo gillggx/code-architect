@@ -151,6 +151,7 @@ class AgentSession:
     plan_b: Optional[Any] = None          # ExecutionPlan | None
     plan_approval_event: asyncio.Event = field(default_factory=asyncio.Event)
     plan_approved_action: Optional[str] = None  # "approve" | "reject" | "stop"
+    clarification_answers: Optional[Dict[str, str]] = None  # answers from clarification round
     plan_b_exhausted: bool = False
     escalation_event: asyncio.Event = field(default_factory=asyncio.Event)
     escalation_action: Optional[str] = None   # "alternative" | "manual_fix" | "stop"
@@ -433,6 +434,7 @@ class AgentRunner:
         chat_history: Optional[List[Dict[str, str]]] = None,
         shell_unrestricted: bool = False,
         auto_approve: bool = False,
+        clarification_answers: Optional[Dict[str, str]] = None,
     ) -> None:
         self.task = task
         self.project_path = project_path
@@ -443,6 +445,8 @@ class AgentRunner:
         self.chat_history: List[Dict[str, str]] = chat_history or []
         self.shell_unrestricted = shell_unrestricted
         self.auto_approve = auto_approve
+        # Answers from a previous clarification round — skip clarity check when set
+        self.clarification_answers: Dict[str, str] = clarification_answers or {}
 
         self._changes: List[FileChange] = []
         self._plan: List[str] = []
@@ -722,6 +726,64 @@ class AgentRunner:
 
         return "\n".join(lines)
 
+    async def _assess_clarity(self) -> tuple[bool, list[str]]:
+        """
+        Ask the LLM whether the task is clear enough to plan.
+
+        Returns:
+            (is_clear, questions) where questions is a list of strings the agent
+            needs answered before it can produce a reliable plan.
+            Always returns (True, []) on LLM error so we don't block execution.
+        """
+        client = self._get_client()
+
+        # Build a 5-turn chat history summary (most recent turns)
+        history_summary = ""
+        if self.chat_history:
+            recent = self.chat_history[-5:]
+            lines = [f"  {m['role'].upper()}: {m['content'][:200]}" for m in recent]
+            history_summary = "Recent conversation:\n" + "\n".join(lines)
+
+        module_names = ", ".join(
+            mod.get("name", "") for mod in self.project_modules[:15]
+        ) or "unknown"
+
+        user_msg = f"""Task: {self.task}
+
+{history_summary}
+
+Project modules available: {module_names}
+
+Evaluate: Is this task specific enough to create a reliable execution plan?
+- A task is CLEAR if it names specific files, functions, or behaviours to change.
+- A task is UNCLEAR if it is vague, contradictory, or missing key details.
+
+Respond with JSON only:
+{{"is_clear": true/false, "questions": ["question 1", "question 2"]}}
+
+questions must be empty [] if is_clear is true.
+questions should be 1-3 SHORT, specific questions if is_clear is false."""
+
+        try:
+            response = await client.chat.completions.create(
+                model=AGENT_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a task clarity assessor. Respond with JSON only."},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=256,
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content or "{}"
+            data = json.loads(raw)
+            is_clear = bool(data.get("is_clear", True))
+            questions = [str(q) for q in data.get("questions", []) if q]
+            return is_clear, questions[:3]
+        except Exception as exc:
+            logger.warning("_assess_clarity failed: %s — skipping", exc)
+            return True, []
+
     async def _generate_plans(self) -> tuple[ExecutionPlan, Optional[ExecutionPlan]]:
         """Call LLM to generate Plan A and optional Plan B."""
         client = self._get_client()
@@ -736,6 +798,19 @@ class AgentRunner:
                 lines.append(f"- {name}: {purpose}")
             module_summary = "\n".join(lines)
 
+        # Inject recent chat history so plan is grounded in conversation context
+        chat_context = ""
+        if self.chat_history:
+            recent = self.chat_history[-5:]
+            lines = [f"  {m['role'].upper()}: {m['content'][:300]}" for m in recent]
+            chat_context = "\nRecent conversation context:\n" + "\n".join(lines) + "\n"
+
+        # Inject clarification answers if provided
+        clarification_context = ""
+        if self.clarification_answers:
+            lines = [f"  Q: {q}\n  A: {a}" for q, a in self.clarification_answers.items()]
+            clarification_context = "\nClarification answers:\n" + "\n".join(lines) + "\n"
+
         # Truncate task to avoid token overflow in planning call
         task_summary = self.task[:800] if len(self.task) > 800 else self.task
 
@@ -744,7 +819,7 @@ class AgentRunner:
             "You always respond with valid JSON only. No markdown, no explanation."
         )
         user_msg = f"""Task: {task_summary}
-
+{chat_context}{clarification_context}
 Relevant modules: {module_summary[:400] if module_summary else "unknown"}
 
 Respond with JSON exactly like this example:
@@ -846,7 +921,54 @@ Now generate the real plan for the task above. You may include plan_b if there i
             return default_plan, None
 
     async def _run_planning_stage(self) -> AsyncIterator[ToolCallEvent]:
-        """Stage 2: Generate Plan A/B, optionally wait for user approval."""
+        """Stage 2: Optionally assess clarity, then generate Plan A/B."""
+
+        # Skip clarity check when: auto_approve, clarification already provided,
+        # or apply/dry_run mode (A2A callers)
+        skip_clarity = (
+            self.auto_approve
+            or bool(self.clarification_answers)
+            or self.mode != "interactive"
+        )
+
+        if not skip_clarity:
+            yield ToolCallEvent(type="message", content="Assessing task clarity...")
+            is_clear, questions = await self._assess_clarity()
+
+            if not is_clear and questions:
+                yield ToolCallEvent(
+                    type="clarification_needed",
+                    content=json.dumps({
+                        "questions": questions,
+                        "task": self.task,
+                        "session_id": self.session_id,
+                    }),
+                    summary=f"Need {len(questions)} clarification{'s' if len(questions) != 1 else ''} before planning",
+                )
+                # Pause and wait for clarification (uses same approval event mechanism)
+                if self._session:
+                    self._session.plan_approval_event.clear()
+                    try:
+                        await asyncio.wait_for(
+                            self._session.plan_approval_event.wait(),
+                            timeout=APPROVAL_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        yield ToolCallEvent(type="error", error="Clarification timeout — agent stopped.")
+                        if self._session:
+                            self._session.status = "stopped"
+                        return
+
+                    action = self._session.plan_approved_action
+                    if action == "stop":
+                        yield ToolCallEvent(type="done", content="Stopped at clarification stage.", changes=[])
+                        if self._session:
+                            self._session.status = "stopped"
+                        return
+                    # clarification_answers injected via approve endpoint — session carries them
+                    if self._session and getattr(self._session, "clarification_answers", None):
+                        self.clarification_answers = self._session.clarification_answers
+
         yield ToolCallEvent(type="message", content="Generating execution plan...")
 
         plan_a, plan_b = await self._generate_plans()

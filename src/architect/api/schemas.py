@@ -516,6 +516,13 @@ class GenerateRequest(BaseModel):
             "contains explicit implementation details (API URLs, libraries, etc.)."
         ),
     )
+    clarification_answers: Optional[Dict[str, str]] = Field(
+        None,
+        description=(
+            "Answers to clarification questions from a previous clarification_needed event. "
+            "When provided, skips clarity assessment and proceeds directly to planning."
+        ),
+    )
 
 
 class FileChangeSchema(BaseModel):
@@ -609,6 +616,10 @@ class ImpactRequest(BaseModel):
     project_id: str = Field(description="Project ID")
     files: List[str] = Field(description="Files being changed")
     change_description: str = Field(description="Description of the change")
+    chat_history: Optional[List[Dict[str, str]]] = Field(
+        None,
+        description="Recent chat messages for context — used to resolve references like 'those 5 improvements'",
+    )
 
 
 class ImpactResponse(BaseModel):
@@ -649,6 +660,7 @@ class ApprovePlanRequest(BaseModel):
     session_id: str
     action: str  # "approve" | "reject" | "stop"
     chosen_plan: Optional[str] = None  # "A" | "B"
+    clarification_answers: Optional[Dict[str, str]] = None  # answers from ClarificationCard
 
 
 class EscalationRequest(BaseModel):
