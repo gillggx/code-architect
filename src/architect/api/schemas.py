@@ -413,12 +413,14 @@ class ChatRequest(BaseModel):
         project_id: Project context for RAG retrieval.
         session_id: Conversation session ID (auto-generated client-side).
         model: Override LLM model (OpenRouter model ID).
+        chat_mode: "agent" (LLM-driven tool loop) | "direct" (Python-driven pipeline, faster, weaker-model-friendly).
     """
     message: str = Field(description="User message", min_length=1)
     project_id: Optional[str] = Field(None, description="Project context")
     session_id: str = Field(description="Conversation session ID")
     model: Optional[str] = Field(None, description="Override LLM model")
     system_override: Optional[str] = Field(None, description="Override system prompt (used by Explain Selection)")
+    chat_mode: str = Field("agent", description="Chat mode: agent | direct")
 
 
 # ============================================================================

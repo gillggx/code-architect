@@ -572,6 +572,65 @@
 .dark-mode .chatbar-mode-btn { color: #666; }
 .dark-mode .chatbar-mode-btn:hover:not(.active) { background: #2a2a2a; }
 
+/* ── ChatBar sub-mode toggle (Agent / Direct) ─────────── */
+
+.chatbar-submode-toggle {
+  display: flex;
+  border: 1px solid #d0d0d0;
+  border-radius: 6px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.chatbar-submode-btn {
+  height: 30px;
+  padding: 0 0.7rem;
+  background: none;
+  border: none;
+  font-size: 0.75rem;
+  cursor: pointer;
+  color: #999;
+  transition: background 0.15s, color 0.15s;
+}
+
+.chatbar-submode-btn.active {
+  background: #2a7a2a;
+  color: #fff;
+  font-weight: 600;
+}
+
+.chatbar-submode-btn:hover:not(.active) {
+  background: #f0f0f0;
+}
+
+.dark-mode .chatbar-submode-toggle { border-color: #444; }
+.dark-mode .chatbar-submode-btn { color: #555; }
+.dark-mode .chatbar-submode-btn.active { background: #1e5c1e; }
+.dark-mode .chatbar-submode-btn:hover:not(.active) { background: #2a2a2a; }
+
+/* ── ChatBar model selector ───────────────────────────── */
+
+.chatbar-model-select {
+  height: 30px;
+  padding: 0 0.4rem;
+  border: 1px solid #d0d0d0;
+  border-radius: 6px;
+  background: none;
+  font-size: 0.72rem;
+  color: #666;
+  cursor: pointer;
+  flex-shrink: 0;
+  max-width: 110px;
+}
+
+.chatbar-model-select:focus { outline: none; border-color: #888; }
+
+.dark-mode .chatbar-model-select {
+  border-color: #444;
+  color: #888;
+  background: #1a1a1a;
+}
+
 .chatbar-unrestricted-btn {
   flex-shrink: 0;
   background: none;

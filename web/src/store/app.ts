@@ -262,6 +262,10 @@ interface AppStore {
   // Chat escalation (tool-use mode escalated to Edit Agent)
   chatEscalation: { task: string; reason: string } | null;
   setChatEscalation: (e: { task: string; reason: string } | null) => void;
+
+  // Chat mode: "agent" (LLM tool loop) | "direct" (Python pipeline)
+  chatMode: 'agent' | 'direct';
+  setChatMode: (m: 'agent' | 'direct') => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +428,10 @@ export const useAppStore = create<AppStore>((set) => ({
   // Chat escalation
   chatEscalation: null,
   setChatEscalation: (e) => set({ chatEscalation: e }),
+
+  // Chat mode
+  chatMode: 'agent',
+  setChatMode: (m) => set({ chatMode: m }),
 }));
 
 // ---------------------------------------------------------------------------

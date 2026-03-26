@@ -138,8 +138,8 @@ CHAT_TOOLS: list[dict] = [
 # Executor
 # ---------------------------------------------------------------------------
 
-MAX_READ_LINES = 200
-MAX_SEARCH_RESULTS = 30
+MAX_READ_LINES = 400       # lines returned by read_file tool (user can override with end_line)
+MAX_SEARCH_RESULTS = 50   # max grep results shown per search_files call
 
 
 def execute_chat_tool(
@@ -189,6 +189,25 @@ def _resolve_path(path: str, project_path: str) -> str:
 
 def _read_file(args: Dict[str, Any], project_path: str) -> Dict[str, Any]:
     path = _resolve_path(args["path"], project_path)
+
+    # If caller passed a directory, return file listing instead of failing silently
+    if os.path.isdir(path):
+        try:
+            entries = sorted(os.listdir(path))
+            files = [e for e in entries if os.path.isfile(os.path.join(path, e))]
+            dirs = [e + "/" for e in entries if os.path.isdir(os.path.join(path, e))]
+            listing = "\n".join(dirs + files)
+            rel = os.path.relpath(path, project_path)
+            return {
+                "ok": False,
+                "error": (
+                    f"`{rel}` is a directory, not a file. "
+                    f"Pick a specific file and call read_file again.\n\nContents:\n{listing}"
+                ),
+            }
+        except OSError as exc:
+            return {"ok": False, "error": f"Cannot list directory: {exc}"}
+
     if not os.path.isfile(path):
         return {"ok": False, "error": f"File not found: {path}"}
 

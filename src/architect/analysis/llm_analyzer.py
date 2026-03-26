@@ -447,13 +447,21 @@ class LLMAnalyzer:
         # Post-process: build imported_by reverse index across all modules
         modules = self._build_imported_by(modules)
 
-        # Persist final modules.json with imported_by populated
+        # Persist final modules.json with imported_by populated.
+        # If no new files were analyzed (all skipped), preserve the existing
+        # modules.json instead of overwriting it with an empty list.
         if memory_dir:
             try:
                 import json as _jfinal
                 modules_path_final = os.path.join(memory_dir, "modules.json")
-                with open(modules_path_final, "w") as _mf:
-                    _jfinal.dump(modules, _mf, ensure_ascii=False, indent=2)
+                if not modules and os.path.exists(modules_path_final):
+                    # All files were cache-hits — load existing data to keep in memory
+                    with open(modules_path_final) as _mf_existing:
+                        modules = _jfinal.load(_mf_existing)
+                    logger.info("All files skipped — preserved %d cached modules from disk", len(modules))
+                else:
+                    with open(modules_path_final, "w") as _mf:
+                        _jfinal.dump(modules, _mf, ensure_ascii=False, indent=2)
             except Exception as _exc:
                 logger.warning("Failed to save final modules.json: %s", _exc)
 
@@ -644,7 +652,7 @@ class LLMAnalyzer:
             try:
                 raw_response = await asyncio.wait_for(
                     self._llm.complete([{"role": "user", "content": prompt}]),
-                    timeout=90.0,
+                    timeout=180.0,
                 )
             except asyncio.TimeoutError:
                 logger.warning("LLM call timed out for %s chunk %d (90s), skipping chunk", file_path, chunk_index)

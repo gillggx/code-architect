@@ -13,6 +13,7 @@ Memory is read-only here — it stores code analysis results, not chat logs.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -216,7 +217,11 @@ class ChatEngine:
         """
         from ..api.tools.chat_tools import CHAT_TOOLS, execute_chat_tool
 
-        MAX_TOOL_ROUNDS = 8
+        MAX_TOOL_ROUNDS = 12
+        # Rough token budget: stop adding more context when estimate exceeds this
+        # (1 char ≈ 0.25 tokens; 80k tokens ≈ 320k chars)
+        TOKEN_CHAR_BUDGET = 280_000
+        MAX_SEARCH_CALLS = 3  # prevent search-loop with weak models
 
         # 1. Retrieve context (same as stream_chat)
         context = await self._retrieve_context(user_message, session.project_id)
@@ -239,19 +244,77 @@ class ChatEngine:
             decision = self.router.route(user_message)
             model = decision.primary_model
 
+        logger.info("stream_chat_v2 start: model=%s project=%s", model, session.project_id)
+
         # 4. Add user turn to history
         session.add("user", user_message)
 
+        # Strategy B: identify files the model SHOULD read first
+        # Pull from jit_snippets (already matched by keyword) + top modules
+        suggested_paths: list[str] = []
+        for s in context.get("jit_snippets", [])[:3]:
+            p = s.get("file", "")
+            if p and p not in suggested_paths:
+                suggested_paths.append(p)
+        if not suggested_paths:
+            for mod in context.get("modules", [])[:2]:
+                p = mod.get("full_path") or mod.get("path", "")
+                if p and p not in suggested_paths:
+                    suggested_paths.append(p)
+
         edit_count = 0
+        search_count = 0
 
         # Phase 1: tool loop
         for _round in range(MAX_TOOL_ROUNDS):
-            msg = await self.llm.complete_with_tools(messages, CHAT_TOOLS, model=model)
+            # Context size guard — estimate tokens before calling LLM
+            ctx_chars = sum(len(str(m.get("content") or "")) for m in messages)
+            logger.info(
+                "Tool round %d/%d — ctx≈%dk chars (~%dk tokens) model=%s",
+                _round + 1, MAX_TOOL_ROUNDS,
+                ctx_chars // 1000,
+                ctx_chars // 4000,
+                model,
+            )
+            if ctx_chars > TOKEN_CHAR_BUDGET:
+                logger.warning(
+                    "stream_chat_v2: context budget exceeded (%d chars), stopping tool loop early",
+                    ctx_chars,
+                )
+                yield {
+                    "type": "error",
+                    "data": f"Context too large ({ctx_chars // 4000}k tokens estimated) — stopping tool loop. Partial answer below.",
+                }
+                break
+
+            # Strategy B: force read_file on round 0 if we have relevant files
+            if _round == 0 and suggested_paths:
+                forced_tool_choice: Any = {"type": "function", "function": {"name": "read_file"}}
+                logger.info("Round 0: forcing tool_choice=read_file, suggested=%s", suggested_paths)
+            else:
+                forced_tool_choice = "auto"
+
+            msg = await self.llm.complete_with_tools(
+                messages, CHAT_TOOLS, model=model, tool_choice=forced_tool_choice
+            )
+
+            # Token limit hit — surface to user and stop
+            if msg.get("__token_limit__"):
+                logger.error("stream_chat_v2: token limit hit at round %d", _round + 1)
+                yield {
+                    "type": "error",
+                    "data": "Token limit reached. The conversation context is too large. Try starting a fresh chat or asking a more specific question.",
+                }
+                session.add("assistant", "[Token limit reached]")
+                yield {"type": "done"}
+                return
+
             messages.append(msg)
 
             tool_calls = msg.get("tool_calls")
             if not tool_calls:
                 # No more tool calls — move to streaming phase
+                logger.info("Tool loop ended at round %d (no tool calls)", _round + 1)
                 break
 
             # Execute each tool call
@@ -262,9 +325,37 @@ class ChatEngine:
                 except (json.JSONDecodeError, KeyError):
                     fn_args = {}
 
+                logger.info(
+                    "  → %s(%s)",
+                    fn_name,
+                    ", ".join(f"{k}={repr(v)[:60]}" for k, v in fn_args.items()),
+                )
                 yield {"type": "tool_thinking", "tool": fn_name, "args": fn_args}
 
+                # Track search calls to prevent loops
+                if fn_name == "search_files":
+                    search_count += 1
+                    if search_count > MAX_SEARCH_CALLS:
+                        logger.warning(
+                            "search_files called %d times — injecting anti-loop guidance",
+                            search_count,
+                        )
+                        tool_content = (
+                            f"[search_files call #{search_count} blocked] "
+                            "You have already searched multiple times. "
+                            "Stop searching and answer based on what you've found, "
+                            "or call read_file on a specific file you identified."
+                        )
+                        yield {"type": "tool_result", "tool": fn_name, "result": tool_content}
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": tool_content,
+                        })
+                        continue
+
                 result = execute_chat_tool(fn_name, fn_args, project_path)
+                logger.info("  ← %s: ok=%s result_len=%d", fn_name, result.get("ok"), len(str(result.get("result", ""))))
 
                 if result.get("escalate"):
                     yield {
@@ -321,6 +412,507 @@ class ChatEngine:
                 yield {"type": "chunk", "data": chunk}
             session.add("assistant", "".join(reply_chunks))
 
+        yield {"type": "done"}
+
+    async def stream_chat_direct(
+        self,
+        session: ChatSession,
+        user_message: str,
+        project_path: str,
+        analysis_status: Optional[str] = None,
+        recent_changes: Optional[str] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Direct mode — Python-driven pipeline. No LLM tool loop.
+
+        Flow:
+          1. Python: keyword-match Architecture Map → find relevant files
+          2. Python: read those files directly (emit tool_thinking events for UI)
+          3. LLM: single streaming call with full context → answer
+
+        Works well with weak models. No tool-use required.
+        Yields same event shapes as stream_chat_v2 (chunk, done, error).
+        """
+        # Token budget constants (model context = 128k tokens = 512k chars)
+        # Reserve 80k chars for system prompt + arch map + response buffer
+        MODEL_CONTEXT_CHARS = 512_000
+        OVERHEAD_CHARS      = 80_000
+        FILE_CHAR_BUDGET    = MODEL_CONTEXT_CHARS - OVERHEAD_CHARS  # 432k chars ≈ 108k tokens
+        MAPREDUCE_THRESHOLD = FILE_CHAR_BUDGET                       # single-pass if under this
+        MAX_FILE_CHARS      = 20_000  # per-file cap (≈5k tokens, ~500 lines)
+
+        # 1. Retrieve context + identify relevant files
+        context = await self._retrieve_context(user_message, session.project_id)
+
+        # Hardcode-specific: magic numbers, credentials, hardcoded values
+        _hardcode_re = re.compile(
+            r"(hardcode|hard.code|magic.number|hard.coded|寫死|硬編碼|audit|grep|列出所有|找出所有|所有檔案|scan)",
+            re.IGNORECASE,
+        )
+        # General scan: code review, problem-finding, quality check
+        _review_re = re.compile(
+            r"(問題|有什麼問題|哪些問題|架構問題|code.quality|code.smell|"
+            r"improvement|what.*wrong|any.*issue|review|檢查|掃描)",
+            re.IGNORECASE,
+        )
+        is_hardcode_query = bool(_hardcode_re.search(user_message))
+        is_wide_scan      = bool(_review_re.search(user_message))
+        is_audit_query    = is_hardcode_query or is_wide_scan   # controls file loading
+
+        # 2a. Audit queries: read ALL source files, auto-switch to MapReduce if too large
+        # 2b. Normal queries: load only relevant files (JIT-matched)
+        _source_exts = {'.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs', '.java', '.kt', '.cs', '.rb'}
+        _skip_dirs = {'/node_modules/', '/dist/', '/.git/', '/build/', '/__pycache__/'}
+
+        loaded_files: list[Dict[str, str]] = []
+        ctx_chars = 0
+
+        if is_audit_query:
+            yield {"type": "mode_note", "data": "Direct mode (per-file deep analysis)"}
+
+            # Collect ALL source files from Architecture Map
+            all_source_paths: list[str] = []
+            for mod in context.get("modules", []):
+                p = mod.get("full_path") or mod.get("path", "")
+                if not p or not os.path.isfile(p):
+                    continue
+                if any(skip in p for skip in _skip_dirs):
+                    continue
+                if os.path.splitext(p)[1].lower() in _source_exts and p not in all_source_paths:
+                    all_source_paths.append(p)
+
+            logger.info(
+                "stream_chat_direct per-file: %d source files, scan_type=%s",
+                len(all_source_paths), "hardcode" if is_hardcode_query else "review",
+            )
+
+            model = self.llm.model if (self.llm._use_custom or not self.llm._use_openrouter) \
+                else self.router.route(user_message).primary_model
+            session.add("user", user_message)
+            scan_type = "hardcode" if is_hardcode_query else "review"
+            async for event in self._per_file_analysis(
+                all_source_paths, project_path, model, session,
+                user_message, scan_type=scan_type, max_file_chars=MAX_FILE_CHARS,
+            ):
+                yield event
+            return
+        else:
+            # Normal query: load JIT-matched files only
+            MAX_FILES = 4
+            candidate_paths: list[str] = []
+            for s in context.get("jit_snippets", [])[:MAX_FILES]:
+                p = s.get("file", "")
+                if p and p not in candidate_paths:
+                    candidate_paths.append(p)
+            if not candidate_paths and context.get("modules"):
+                _skip_exts = {'.md', '.mdx', '.txt', '.rst', '.yml', '.yaml', '.toml', '.lock'}
+                for mod in context["modules"][:MAX_FILES * 2]:
+                    p = mod.get("full_path") or mod.get("path", "")
+                    if not p or not os.path.isfile(p) or p in candidate_paths:
+                        continue
+                    ext = os.path.splitext(p)[1].lower()
+                    fname = os.path.basename(p).lower()
+                    if ext in _skip_exts:
+                        continue
+                    if ext == '.json' and fname != 'package.json':
+                        continue
+                    candidate_paths.append(p)
+                    if len(candidate_paths) >= MAX_FILES:
+                        break
+
+            for path in candidate_paths:
+                if ctx_chars >= FILE_CHAR_BUDGET:
+                    break
+                yield {"type": "tool_thinking", "tool": "read_file", "args": {"path": path}}
+                try:
+                    with open(path, encoding="utf-8", errors="ignore") as f:
+                        content = f.read(MAX_FILE_CHARS)
+                    if len(content) == MAX_FILE_CHARS:
+                        content += "\n... [truncated]"
+                    loaded_files.append({"path": path, "content": content})
+                    ctx_chars += len(content)
+                except OSError as e:
+                    logger.warning("  could not read %s: %s", path, e)
+
+        logger.info(
+            "stream_chat_direct single-pass: model=%s hardcode=%s wide_scan=%s files_loaded=%d ctx_chars=%d",
+            self.llm.model, is_hardcode_query, is_wide_scan, len(loaded_files), ctx_chars,
+        )
+
+        # 3. Build system prompt + inject all loaded file contents
+        system_prompt = self._build_system_prompt(
+            session.project_id, context,
+            analysis_status=analysis_status,
+            recent_changes=recent_changes,
+            tool_use=False,
+        )
+
+        if loaded_files:
+            if is_hardcode_query:
+                scan_note = (
+                    "\nAnalyze each file carefully. Distinguish between:\n"
+                    "- TRUE hardcode problems: magic numbers, business logic values, credentials, URLs that should be configurable\n"
+                    "- NORMAL defaults: reasonable default values for props/params, standard config like `outDir: 'dist'`\n"
+                    "Only report TRUE hardcode problems with file path and line number.\n"
+                )
+            elif is_wide_scan:
+                scan_note = (
+                    "\nDo a thorough code review. Report ALL types of problems:\n"
+                    "- Bugs: incorrect behavior, crashes, wrong output, data loss\n"
+                    "- Missing features: error boundaries, input validation, error handling\n"
+                    "- Logic errors: edge cases not handled, incorrect algorithms\n"
+                    "- Design issues: violated patterns, tight coupling, unclear responsibilities\n"
+                    "- Documentation mismatches: comments/JSDoc that contradict actual code\n"
+                    "For each issue: cite exact file path + line number + quote the relevant code.\n"
+                    "Separate TRUE bugs from design improvement opportunities.\n"
+                )
+            else:
+                scan_note = ""
+            file_section = [f"\n## Source Code (all project source files){scan_note}"]
+            for lf in loaded_files:
+                rel = os.path.relpath(lf["path"], project_path) if project_path else lf["path"]
+                file_section.append(f"\n### {rel}\n```\n{lf['content']}\n```")
+            system_prompt += "\n" + "\n".join(file_section)
+        else:
+            system_prompt += "\n\n## Note\nCould not read source files. Answer from Architecture Map above."
+
+        # Build messages
+        messages: list[dict] = [{"role": "system", "content": system_prompt}]
+        messages.extend(session.to_openai_messages())
+        messages.append({"role": "user", "content": user_message})
+
+        # Route model (same logic as v2)
+        if self.llm._use_custom or not self.llm._use_openrouter:
+            model = self.llm.model
+        else:
+            decision = self.router.route(user_message)
+            model = decision.primary_model
+
+        # 4. Add user turn to history
+        session.add("user", user_message)
+
+        # 5. Single streaming LLM call
+        reply_chunks: list[str] = []
+        async for chunk in self.llm.stream(messages, model=model):
+            reply_chunks.append(chunk)
+            yield {"type": "chunk", "data": chunk}
+
+        session.add("assistant", "".join(reply_chunks))
+        yield {"type": "done"}
+
+    # ------------------------------------------------------------------
+    # Per-file deep analysis helper
+    # ------------------------------------------------------------------
+
+    async def _per_file_analysis(
+        self,
+        all_source_paths: list,
+        project_path: str,
+        model: str,
+        session: "ChatSession",
+        user_message: str,
+        scan_type: str,
+        max_file_chars: int,
+    ):
+        """
+        Per-file deep analysis: each source file gets its own dedicated LLM call.
+
+        Phase 1 (Map):    for each file → LLM extracts findings as JSON
+        Phase 2 (Reduce): consolidation call → stream final formatted report
+        """
+        if not all_source_paths:
+            yield {"type": "chunk", "data": "No source files found to analyze."}
+            session.add("assistant", "No source files found to analyze.")
+            yield {"type": "done"}
+            return
+
+        # Build per-file prompts based on scan_type
+        if scan_type == "hardcode":
+            def _make_file_prompt(rel_path: str, content: str) -> str:
+                return (
+                    f"Analyze this file for hardcoded values: {rel_path}\n\n"
+                    "Find ALL hardcoded values that should be configurable.\n"
+                    "Return ONLY a JSON array — no prose, no markdown wrapper.\n"
+                    "Each item: {\"file\": str, \"line\": int, \"value\": str, \"type\": str, \"severity\": str, \"reason\": str}\n"
+                    "Types: magic_number | hardcoded_string | hardcoded_url | hardcoded_credential | business_logic_constant\n"
+                    "Severity: critical | high | medium | low\n"
+                    "SKIP: reasonable prop/param defaults, standard build config (outDir, port 5173, es2020), test fixtures.\n"
+                    "If nothing found, return []\n\n"
+                    f"```\n{content}\n```"
+                )
+        else:  # review
+            def _make_file_prompt(rel_path: str, content: str) -> str:
+                return (
+                    f"Do a thorough code review of this file: {rel_path}\n\n"
+                    "Report ALL problems you find with MANDATORY code quotes.\n"
+                    "Return ONLY a JSON array — no prose, no markdown wrapper.\n"
+                    "Each item: {\n"
+                    "  \"file\": str,\n"
+                    "  \"line\": int,\n"
+                    "  \"category\": str,\n"
+                    "  \"severity\": str,\n"
+                    "  \"description\": str,\n"
+                    "  \"code_quote\": str,\n"
+                    "  \"suggestion\": str\n"
+                    "}\n"
+                    "Categories: bug | logic_error | missing_validation | error_handling | design_issue | doc_mismatch\n"
+                    "Severity: critical | high | medium | low\n"
+                    "MANDATORY: code_quote must contain the EXACT lines that prove the issue. "
+                    "If you cannot quote the code, do NOT include the item.\n"
+                    "Separate TRUE bugs from design improvement opportunities via category.\n"
+                    "If nothing found, return []\n\n"
+                    f"```\n{content}\n```"
+                )
+
+        total = len(all_source_paths)
+        all_findings: list = []
+
+        async def _collect_stream(msgs: list, mdl: str) -> str:
+            result = ""
+            async for chunk in self.llm.stream(msgs, model=mdl):
+                result += chunk
+            return result
+
+        # ── Phase 1: Per-file LLM calls ───────────────────────────────
+        for idx, path in enumerate(all_source_paths):
+            rel = os.path.relpath(path, project_path) if project_path else path
+            yield {
+                "type": "mode_note",
+                "data": f"Analyzing {idx + 1}/{total}: {rel}",
+            }
+            yield {"type": "tool_thinking", "tool": "read_file", "args": {"path": path}}
+
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as f:
+                    content = f.read(max_file_chars)
+                if len(content) == max_file_chars:
+                    content += "\n... [truncated]"
+            except OSError as e:
+                logger.warning("_per_file_analysis: cannot read %s: %s", path, e)
+                continue
+
+            file_prompt = _make_file_prompt(rel, content)
+            file_messages = [
+                {"role": "system", "content": file_prompt},
+                {"role": "user", "content": "Analyze and return findings as JSON array."},
+            ]
+
+            try:
+                raw = ""
+                raw = await asyncio.wait_for(_collect_stream(file_messages, model), timeout=60.0)
+
+                # Strip markdown code fence if LLM wrapped the JSON
+                stripped = raw.strip()
+                if stripped.startswith("```"):
+                    lines_raw = stripped.splitlines()
+                    inner = lines_raw[1:-1] if lines_raw[-1].strip() == "```" else lines_raw[1:]
+                    stripped = "\n".join(inner)
+
+                file_findings = json.loads(stripped)
+                if isinstance(file_findings, list):
+                    # Ensure file field is set correctly
+                    for item in file_findings:
+                        if isinstance(item, dict):
+                            item.setdefault("file", rel)
+                    all_findings.extend(file_findings)
+                    logger.info("_per_file_analysis [%d/%d] %s: %d findings", idx + 1, total, rel, len(file_findings))
+            except asyncio.TimeoutError:
+                logger.warning("_per_file_analysis: timeout on %s, skipping", rel)
+            except (json.JSONDecodeError, Exception) as exc:
+                logger.warning("_per_file_analysis: parse error on %s: %s", rel, exc)
+                # Keep raw in findings for consolidation phase to surface
+                if raw.strip():
+                    all_findings.append({"_raw": raw[:500], "_file": rel, "_parse_error": str(exc)})
+
+        # ── Phase 2: Consolidation ────────────────────────────────────
+        yield {"type": "mode_note", "data": f"Consolidating {len(all_findings)} findings across {total} files…"}
+
+        if not all_findings:
+            msg = "No issues found across all source files."
+            yield {"type": "chunk", "data": msg}
+            session.add("assistant", msg)
+            yield {"type": "done"}
+            return
+
+        findings_json = json.dumps(all_findings, ensure_ascii=False, indent=2)
+
+        if scan_type == "hardcode":
+            reduce_instructions = (
+                "Group findings by severity: Critical (credentials/URLs) > High (business logic) > Medium (magic numbers) > Low.\n"
+                "For each issue: file path, line number, the hardcoded value, fix suggestion.\n"
+                "Also note any patterns (e.g., timeouts hardcoded across multiple files).\n"
+                "Summarise what was correctly treated as normal defaults."
+            )
+        else:
+            reduce_instructions = (
+                "Group findings into two sections:\n"
+                "## True Bugs (must fix)\n"
+                "  - Categories: bug, logic_error, missing_validation, error_handling\n"
+                "  - Sort by severity (critical first)\n"
+                "## Design Improvements (should fix)\n"
+                "  - Categories: design_issue, doc_mismatch\n"
+                "For each item: file path + line + quoted code + description + suggestion.\n"
+                "At the end: a brief executive summary of overall code health."
+            )
+
+        reduce_prompt = (
+            f"Original question: {user_message}\n\n"
+            f"Below are findings extracted individually from {total} source files.\n"
+            "Format them into a clear, well-structured report in the same language as the original question.\n"
+            f"{reduce_instructions}\n\n"
+            f"Findings:\n```json\n{findings_json}\n```"
+        )
+        reduce_messages = [
+            {"role": "system", "content": reduce_prompt},
+            {"role": "user", "content": user_message},
+        ]
+
+        reply_chunks: list = []
+        async for chunk in self.llm.stream(reduce_messages, model=model, max_tokens=16384):
+            reply_chunks.append(chunk)
+            yield {"type": "chunk", "data": chunk}
+
+        session.add("assistant", "".join(reply_chunks))
+        yield {"type": "done"}
+
+    # ------------------------------------------------------------------
+    # Audit MapReduce helper (legacy — kept for reference)
+    # ------------------------------------------------------------------
+
+    async def _audit_mapreduce(
+        self,
+        all_source_paths: list[str],
+        project_path: str,
+        model: str,
+        session: "ChatSession",
+        user_message: str,
+        max_file_chars: int,
+    ):
+        """
+        MapReduce audit for large projects that exceed single-pass context budget.
+
+        Phase 1 (Map):    split files into batches → LLM extracts hardcodes as JSON per batch
+        Phase 2 (Reduce): consolidate all JSON findings → stream final formatted report
+        """
+        MAPREDUCE_BATCH_CHARS = 300_000  # safe per-batch file budget
+
+        # Build batches
+        batches: list[list[str]] = []
+        current_batch: list[str] = []
+        current_chars = 0
+        for path in all_source_paths:
+            try:
+                estimated = min(os.path.getsize(path), max_file_chars)
+            except OSError:
+                estimated = max_file_chars
+            if current_chars + estimated > MAPREDUCE_BATCH_CHARS and current_batch:
+                batches.append(current_batch)
+                current_batch = [path]
+                current_chars = estimated
+            else:
+                current_batch.append(path)
+                current_chars += estimated
+        if current_batch:
+            batches.append(current_batch)
+
+        yield {
+            "type": "mode_note",
+            "data": f"MapReduce mode: {len(all_source_paths)} files → {len(batches)} batches",
+        }
+        logger.info("_audit_mapreduce: %d files, %d batches", len(all_source_paths), len(batches))
+
+        # ── Phase 1: Map ──────────────────────────────────────────────
+        all_findings: list[dict] = []
+
+        for batch_idx, batch_paths in enumerate(batches):
+            yield {
+                "type": "mode_note",
+                "data": f"Scanning batch {batch_idx + 1}/{len(batches)} ({len(batch_paths)} files)…",
+            }
+
+            batch_files: list[dict] = []
+            for path in batch_paths:
+                yield {"type": "tool_thinking", "tool": "read_file", "args": {"path": path}}
+                try:
+                    with open(path, encoding="utf-8", errors="ignore") as f:
+                        content = f.read(max_file_chars)
+                    if len(content) == max_file_chars:
+                        content += "\n... [truncated]"
+                    batch_files.append({"path": path, "content": content})
+                except OSError as e:
+                    logger.warning("MapReduce batch %d: cannot read %s: %s", batch_idx + 1, path, e)
+
+            if not batch_files:
+                continue
+
+            file_section = "\n\n".join(
+                f"### {os.path.relpath(lf['path'], project_path) if project_path else lf['path']}\n```\n{lf['content']}\n```"
+                for lf in batch_files
+            )
+            extraction_prompt = (
+                "You are a code auditor. Find ALL hardcoded values in the files below.\n"
+                "Return ONLY a JSON array — no prose, no markdown wrapper.\n"
+                "Each item: {\"file\": str, \"line\": int, \"value\": str, \"type\": str, \"reason\": str}\n"
+                "Types: magic_number | hardcoded_string | hardcoded_url | hardcoded_credential | business_logic_constant\n"
+                "SKIP: reasonable prop/param defaults, standard build config (outDir, port 5173, es2020), test fixtures.\n"
+                "If nothing found, return []\n\n"
+                + file_section
+            )
+            map_messages = [
+                {"role": "system", "content": extraction_prompt},
+                {"role": "user", "content": "Extract hardcodes as JSON array."},
+            ]
+
+            try:
+                raw = ""
+                async for chunk in self.llm.stream(map_messages, model=model):
+                    raw += chunk
+
+                # Strip markdown code fence if LLM wrapped the JSON
+                stripped = raw.strip()
+                if stripped.startswith("```"):
+                    lines = stripped.splitlines()
+                    inner = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+                    stripped = "\n".join(inner)
+
+                batch_findings = json.loads(stripped)
+                if isinstance(batch_findings, list):
+                    all_findings.extend(batch_findings)
+                    logger.info("MapReduce batch %d: %d findings", batch_idx + 1, len(batch_findings))
+            except (json.JSONDecodeError, Exception) as exc:
+                logger.warning("MapReduce batch %d parse error: %s", batch_idx + 1, exc)
+                all_findings.append({"_raw": raw, "_batch": batch_idx + 1, "_parse_error": str(exc)})
+
+        # ── Phase 2: Reduce ───────────────────────────────────────────
+        yield {"type": "mode_note", "data": f"Consolidating {len(all_findings)} findings…"}
+
+        if not all_findings:
+            yield {"type": "chunk", "data": "No hardcode issues found across all source files."}
+            session.add("assistant", "No hardcode issues found across all source files.")
+            yield {"type": "done"}
+            return
+
+        findings_json = json.dumps(all_findings, ensure_ascii=False, indent=2)
+        reduce_prompt = (
+            f"Original question: {user_message}\n\n"
+            "Below are hardcode findings extracted from all source files in batches.\n"
+            "Format them into a clear, well-structured report in the same language as the original question.\n"
+            "Group by severity: Critical (credentials/URLs) > High (business logic) > Medium (magic numbers) > Low (style defaults).\n"
+            "For each issue: file path, line number, the hardcoded value, fix suggestion.\n"
+            "Also summarise what was correctly treated as normal defaults.\n\n"
+            f"Findings:\n```json\n{findings_json}\n```"
+        )
+        reduce_messages = [
+            {"role": "system", "content": reduce_prompt},
+            {"role": "user", "content": user_message},
+        ]
+
+        reply_chunks: list[str] = []
+        async for chunk in self.llm.stream(reduce_messages, model=model):
+            reply_chunks.append(chunk)
+            yield {"type": "chunk", "data": chunk}
+
+        session.add("assistant", "".join(reply_chunks))
         yield {"type": "done"}
 
     # ------------------------------------------------------------------
@@ -426,10 +1018,12 @@ class ChatEngine:
         # FULL_CONTEXT or audit-style queries ("audit", "hardcode", "all files") —
         # scan all source files instead of trying to match keywords
         is_audit = route == "FULL_CONTEXT" or bool(re.search(
-            r'(hardcode|hard.code|magic.number|literal|audit|所有檔案|全部|scan all|grep)',
+            r'(hardcode|hard.code|magic.number|literal|audit|所有檔案|全部|scan all|grep|'
+            r'問題|有什麼問題|哪些問題|架構問題|code.quality|code.smell|'
+            r'improvement|what.*wrong|any.*issue|review|檢查|掃描)',
             query_lower,
         ))
-        max_snippets = 8 if is_audit else 4
+        max_snippets = 12 if is_audit else 4
 
         scored: List[tuple[int, dict]] = []
         for mod in modules:
@@ -438,9 +1032,16 @@ class ChatEngine:
             if not path or not os.path.isfile(path):
                 continue
 
-            # Skip non-source files for audit scans (skip docs, configs)
             ext = os.path.splitext(path)[1].lower()
-            if is_audit and ext in ('.md', '.json', '.yml', '.yaml', '.toml', '.txt', '.lock'):
+            fname = os.path.basename(path).lower()
+
+            # Always skip docs and config files — they are stale or not ground truth.
+            # Exception: package.json is useful for dependency questions.
+            _always_skip_exts = {'.md', '.mdx', '.txt', '.rst'}
+            _config_exts = {'.json', '.yml', '.yaml', '.toml', '.lock'}
+            if ext in _always_skip_exts:
+                continue
+            if ext in _config_exts and fname != 'package.json':
                 continue
 
             mod_name = (mod.get("name") or "").lower()
@@ -451,6 +1052,9 @@ class ChatEngine:
                 " ".join(mod.get("public_interface", [])),
             ])).lower()
 
+            SOURCE_EXTS = {'.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs', '.java', '.kt', '.swift', '.cs', '.cpp', '.c', '.rb', '.php'}
+            is_source = ext in SOURCE_EXTS
+
             if is_audit:
                 score = 1  # include everything for audit queries
             else:
@@ -459,6 +1063,8 @@ class ChatEngine:
                 score = len(overlap) + (5 if mod_name in query_lower else 0)
                 if score == 0:
                     continue
+                if is_source:
+                    score += 3
 
             scored.append((score, mod, path))  # type: ignore[arg-type]
 
@@ -534,6 +1140,7 @@ class ChatEngine:
         analysis_status: Optional[str] = None,
         recent_changes: Optional[str] = None,
         tool_use: bool = False,
+        suggested_paths: Optional[List[str]] = None,
     ) -> str:
         """Build system prompt with retrieved code context."""
 
@@ -548,6 +1155,71 @@ class ChatEngine:
             soul,
             "",
         ]
+
+        # --- Tool behavior rules go FIRST (before context) so they are not buried ---
+        if tool_use:
+            lines.append(
+                "## How to Use Your Tools — FOLLOW THIS SEQUENCE EVERY TIME\n"
+                "\n"
+                "**STEP 1 — Look at the Architecture Map below.**\n"
+                "  Find the module most relevant to the question. Each entry shows the EXACT file path.\n"
+                "\n"
+                "**STEP 2 — Call `read_file(path)` using that path.**\n"
+                "  Read the file before answering any implementation question. Do NOT guess from memory.\n"
+                "\n"
+                "**STEP 3 — Answer based on the actual code you read.**\n"
+                "  Cite file + line numbers. Be specific.\n"
+                "\n"
+                "**`search_files` is a last resort.** Use it ONLY when the Architecture Map has no\n"
+                "matching file path for the question. Limit: max 2 calls per response.\n"
+                "After every search, you MUST call `read_file` on the best result before searching again.\n"
+                "\n"
+                "**Edit rules:**\n"
+                "- Simple change (1 file, <10 lines): use `edit_file`, then confirm what changed.\n"
+                "- Complex change (2+ files, new files, refactor): use `escalate_to_edit_agent` immediately.\n"
+                "- NEVER ask the user to paste code — read it yourself with `read_file`.\n"
+                "\n"
+                "**Example of correct flow:**\n"
+                "```\n"
+                "User: 'How does the auth middleware work?'\n"
+                "→ Check map: auth_middleware → /project/src/middleware/auth.py\n"
+                "→ Call: read_file('/project/src/middleware/auth.py')\n"
+                "→ Answer from the code\n"
+                "```\n"
+                "\n"
+                "**Anti-hallucination rules (CRITICAL):**\n"
+                "- If read_file returns an error or says 'is a directory', do NOT guess the file content.\n"
+                "  Pick a specific file from the listing and call read_file again.\n"
+                "- If search_files returns 'No matches found', do NOT invent results.\n"
+                "  Try a different query or state clearly that nothing was found.\n"
+                "- NEVER fabricate code examples. Only quote code you have actually read with read_file.\n"
+                "- If you cannot read the required file, say so explicitly instead of guessing.\n"
+                "\n"
+                "**Citation requirement — MANDATORY:**\n"
+                "- For EVERY problem or issue you report, you MUST quote the exact lines of code that prove it.\n"
+                "- Format: `filename:line_number` followed by the quoted code.\n"
+                "- If you cannot find or quote the specific code, do NOT report it as a problem.\n"
+                "- Do not report issues based on absence of something unless you have read the full file.\n"
+                "\n"
+                "**Bug vs Design choice — report them separately:**\n"
+                "- TRUE bugs: incorrect behavior, crashes, wrong output, data loss, security issues.\n"
+                "- Design choices / improvement opportunities: valid patterns that could be better.\n"
+                "- Never escalate a design choice to 'critical' or 'P0'. Keep severity accurate.\n"
+                "\n"
+                "**Source code vs documentation priority:**\n"
+                "- `.md` files marked [doc] in the Architecture Map are documentation — they describe\n"
+                "  what the code *should* do, but may be outdated. They are NOT ground truth.\n"
+                "- When asked about bugs, problems, code quality, or implementation details:\n"
+                "  1. FIRST read source files (.ts, .py, .js, etc.) to see what the code actually does.\n"
+                "  2. THEN read [doc] files only for background context if needed.\n"
+                "- Never answer a code question by only reading documentation files.\n"
+                "\n"
+                "**Files you must NEVER read (unless explicitly asked):**\n"
+                "- `.md`, `.mdx`, `.txt`, `.rst` — documentation files. They may be stale or opinionated.\n"
+                "- `.json` (except `package.json`), `.yml`, `.yaml`, `.toml`, `.lock` — config/data files.\n"
+                "  Exception: if the user explicitly asks about README, CHANGELOG, or config files, you may read them.\n"
+                "- If the Architecture Map shows REPORT, RECOMMENDATION, SUMMARY, COMPLETION in the filename — skip it entirely.\n"
+            )
 
         if analysis_status:
             lines.append(f"## ⚠️ IMPORTANT: {analysis_status}")
@@ -613,13 +1285,33 @@ class ChatEngine:
                 lines.append("")
 
             else:
-                # MAP_THEN_JIT / FULL_CONTEXT: compact map for navigation
+                # MAP_THEN_JIT / FULL_CONTEXT: compact map for navigation with full paths
+                # Only source files listed with paths — doc files shown as a name-only summary
                 lines.append("## Architecture Map (use for navigation — read files for details)")
-                for mod in modules[:30]:
+                lines.append("Source code files only. Do NOT read documentation files unless the user asks.\n")
+                _doc_exts = {'.md', '.mdx', '.txt', '.rst'}
+                _skip_map_exts = {'.json', '.yml', '.yaml', '.toml', '.lock'}
+                _source_mods = []
+                _doc_names = []
+                for mod in modules[:40]:
+                    fp = mod.get("full_path") or mod.get("path", "")
+                    ext = os.path.splitext(fp)[1].lower() if fp else ""
+                    fname = os.path.basename(fp).lower() if fp else ""
+                    if ext in _doc_exts:
+                        _doc_names.append(mod.get("name") or fname)
+                    elif ext in _skip_map_exts and fname != 'package.json':
+                        pass  # skip config/data files entirely
+                    else:
+                        _source_mods.append(mod)
+                for mod in _source_mods[:25]:
                     name = mod.get("name") or mod.get("file", "unknown")
                     purpose = mod.get("purpose", "")
                     critical = mod.get("critical_path", False)
-                    lines.append(f"- **{name}**{' [critical]' if critical else ''}: {purpose}")
+                    full_path = mod.get("full_path") or mod.get("path", "")
+                    path_label = f" → `{full_path}`" if full_path else ""
+                    lines.append(f"- **{name}**{' [critical]' if critical else ''}{path_label}: {purpose}")
+                if _doc_names:
+                    lines.append(f"\nDocumentation files (do not read unless asked): {', '.join(_doc_names[:10])}")
                 lines.append("")
 
         # Phase 3: inject JIT code snippets
@@ -648,24 +1340,6 @@ class ChatEngine:
             lines.append(
                 "Note: No project has been analyzed yet. "
                 "Ask the user to run an analysis first, or answer from general knowledge."
-            )
-
-        if tool_use:
-            lines.append(
-                "\n## Tools Available\n"
-                "You have tools to read and modify the codebase directly:\n\n"
-                "- `read_file(path)` — Read a file. Use before answering implementation questions.\n"
-                "- `search_files(query, directory?, file_pattern?)` — Grep across files.\n"
-                "- `edit_file(path, old_str, new_str)` — Apply a targeted single-file edit.\n"
-                "  - Use ONLY for simple changes: 1 file, <10 lines changed, straightforward fix.\n"
-                "- `escalate_to_edit_agent(task, reason)` — Hand off to Edit Agent.\n"
-                "  - Use when: 2+ files need changing, new files required, complex refactor.\n\n"
-                "**Rules:**\n"
-                "1. NEVER ask the user to share code — read files yourself.\n"
-                "2. For write requests: assess complexity first.\n"
-                "   - Simple (1 file, <10 lines): edit_file, then confirm what you changed.\n"
-                "   - Complex (multi-file, architectural): escalate_to_edit_agent immediately.\n"
-                "3. After reading files, answer directly without re-asking.\n"
             )
 
         lines.append(

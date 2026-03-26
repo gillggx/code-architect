@@ -1180,14 +1180,37 @@ def create_app(debug: bool = False) -> FastAPI:
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     return
 
-                # Tool-use mode when project_path is available
+                # Route by chat_mode when project_path is available
                 if project_path:
-                    async for evt in _app_state.chat_engine.stream_chat_v2(
-                        session, request.message,
-                        project_path=project_path,
-                        analysis_status=analysis_status,
-                        recent_changes=recent_changes,
-                    ):
+                    chat_mode = getattr(request, "chat_mode", "agent")
+                    # Audit/hardcode queries: always force Direct mode regardless of user setting.
+                    # Python grep returns real results; Agent mode risks fabricating code from docs.
+                    import re as _re
+                    _audit_pattern = _re.compile(
+                        r"(hardcode|hard.code|magic.number|hard.coded|寫死|硬編碼|"
+                        r"audit|scan all|列出所有|找出所有|有多少|grep|"
+                        r"問題|有什麼問題|哪些問題|架構問題|code.quality|code.smell|"
+                        r"improvement|what.*wrong|any.*issue|review|檢查|掃描)",
+                        _re.IGNORECASE,
+                    )
+                    if _audit_pattern.search(request.message):
+                        chat_mode = "direct"
+                        logger.info("Chat: audit query detected — forcing Direct mode")
+                    if chat_mode == "direct":
+                        stream_fn = _app_state.chat_engine.stream_chat_direct(
+                            session, request.message,
+                            project_path=project_path,
+                            analysis_status=analysis_status,
+                            recent_changes=recent_changes,
+                        )
+                    else:
+                        stream_fn = _app_state.chat_engine.stream_chat_v2(
+                            session, request.message,
+                            project_path=project_path,
+                            analysis_status=analysis_status,
+                            recent_changes=recent_changes,
+                        )
+                    async for evt in stream_fn:
                         yield f"data: {json.dumps(evt)}\n\n"
                     return
 

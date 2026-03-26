@@ -50,13 +50,14 @@ class LLMClient:
         self.max_tokens = max_tokens
 
         self._api_key = os.getenv("OPENROUTER_API_KEY", "")
-        self._use_openrouter = bool(self._api_key)
-        self._use_custom = bool(CUSTOM_LLM_BASE_URL) and not self._use_openrouter
+        # CUSTOM_LLM_BASE_URL takes priority over OpenRouter
+        self._use_custom = bool(CUSTOM_LLM_BASE_URL)
+        self._use_openrouter = bool(self._api_key) and not self._use_custom
 
-        if self._use_openrouter:
-            logger.info("LLMClient: using OpenRouter (%s)", model)
-        elif self._use_custom:
+        if self._use_custom:
             logger.info("LLMClient: using custom LLM endpoint %s (%s)", CUSTOM_LLM_BASE_URL, model)
+        elif self._use_openrouter:
+            logger.info("LLMClient: using OpenRouter (%s)", model)
         else:
             logger.info("LLMClient: no OPENROUTER_API_KEY or CUSTOM_LLM_BASE_URL — falling back to Ollama")
 
@@ -68,6 +69,7 @@ class LLMClient:
         self,
         messages: list[dict],
         model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> AsyncIterator[str]:
         """
         Stream a chat completion, yielding text chunks.
@@ -81,15 +83,16 @@ class LLMClient:
             str text chunks as they arrive from the API.
         """
         chosen_model = model or self.model
+        chosen_max_tokens = max_tokens or self.max_tokens
 
         if self._use_openrouter:
-            async for chunk in self._stream_openrouter(messages, chosen_model):
+            async for chunk in self._stream_openrouter(messages, chosen_model, chosen_max_tokens):
                 yield chunk
         elif self._use_custom:
-            async for chunk in self._stream_custom(messages, chosen_model):
+            async for chunk in self._stream_custom(messages, chosen_model, chosen_max_tokens):
                 yield chunk
         else:
-            async for chunk in self._stream_ollama(messages, chosen_model):
+            async for chunk in self._stream_ollama(messages, chosen_model, chosen_max_tokens):
                 yield chunk
 
     async def complete_with_tools(
@@ -97,6 +100,7 @@ class LLMClient:
         messages: list[dict],
         tools: list[dict],
         model: Optional[str] = None,
+        tool_choice: Any = "auto",
     ) -> dict[str, Any]:
         """
         Non-streaming completion with tool support (function calling).
@@ -106,6 +110,8 @@ class LLMClient:
           {"role": "assistant", "content": None, "tool_calls": [...]}  — tool invocation
 
         Falls back to plain completion for backends that don't support tool use (Ollama).
+
+        tool_choice: "auto" | "none" | {"type": "function", "function": {"name": "..."}}
         """
         chosen_model = model or self.model
 
@@ -114,6 +120,7 @@ class LLMClient:
                 messages, tools, chosen_model,
                 api_key=self._api_key,
                 base_url=OPENROUTER_BASE_URL,
+                tool_choice=tool_choice,
                 extra_headers={
                     "HTTP-Referer": "https://github.com/code-architect-agent",
                     "X-Title": "Code Architect Agent",
@@ -124,6 +131,7 @@ class LLMClient:
                 messages, tools, chosen_model,
                 api_key=CUSTOM_LLM_API_KEY,
                 base_url=CUSTOM_LLM_BASE_URL,
+                tool_choice=tool_choice,
             )
         else:
             # Ollama has limited tool support — fall back to plain completion
@@ -138,6 +146,7 @@ class LLMClient:
         model: str,
         api_key: str,
         base_url: str,
+        tool_choice: Any = "auto",
         extra_headers: Optional[dict] = None,
     ) -> dict[str, Any]:
         try:
@@ -152,7 +161,7 @@ class LLMClient:
             model=model,
             messages=messages,  # type: ignore[arg-type]
             tools=tools,  # type: ignore[arg-type]
-            tool_choice="auto",
+            tool_choice=tool_choice,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
@@ -175,9 +184,22 @@ class LLMClient:
                     }
                     for tc in msg.tool_calls
                 ]
+            # Log finish reason for debugging
+            finish_reason = response.choices[0].finish_reason
+            if finish_reason and finish_reason not in ("stop", "tool_calls"):
+                logger.warning("complete_with_tools: finish_reason=%s model=%s", finish_reason, model)
             return result
         except Exception as exc:
-            logger.error("complete_with_tools error: %s", exc)
+            exc_str = str(exc)
+            # Detect token/context limit errors specifically so the caller can handle them
+            is_token_limit = any(k in exc_str.lower() for k in (
+                "context_length_exceeded", "maximum context", "token", "context window",
+                "too long", "exceeds", "reduce", "input is too",
+            ))
+            if is_token_limit:
+                logger.error("complete_with_tools: TOKEN LIMIT HIT — model=%s error=%s", model, exc_str)
+                return {"role": "assistant", "content": "", "__token_limit__": True}
+            logger.error("complete_with_tools error: model=%s error=%s", model, exc_str)
             return {"role": "assistant", "content": f"[LLM Error: {exc}]"}
 
     async def complete(
@@ -215,7 +237,7 @@ class LLMClient:
     # ------------------------------------------------------------------
 
     async def _stream_openrouter(
-        self, messages: list[dict], model: str
+        self, messages: list[dict], model: str, max_tokens: int = 4096
     ) -> AsyncIterator[str]:
         try:
             from openai import AsyncOpenAI
@@ -234,7 +256,7 @@ class LLMClient:
                 model=model,
                 messages=messages,  # type: ignore[arg-type]
                 temperature=self.temperature,
-                max_tokens=self.max_tokens,
+                max_tokens=max_tokens,
                 stream=True,
                 extra_headers={
                     "HTTP-Referer": "https://github.com/code-architect-agent",
@@ -254,7 +276,7 @@ class LLMClient:
     # ------------------------------------------------------------------
 
     async def _stream_custom(
-        self, messages: list[dict], model: str
+        self, messages: list[dict], model: str, max_tokens: int = 4096
     ) -> AsyncIterator[str]:
         """Stream from a custom OpenAI-compatible endpoint.
         Model name is used as-is — no mapping applied.
@@ -276,7 +298,7 @@ class LLMClient:
                 model=model,
                 messages=messages,  # type: ignore[arg-type]
                 temperature=self.temperature,
-                max_tokens=self.max_tokens,
+                max_tokens=max_tokens,
                 stream=True,
             )
             async for chunk in stream:
@@ -292,7 +314,7 @@ class LLMClient:
     # ------------------------------------------------------------------
 
     async def _stream_ollama(
-        self, messages: list[dict], model: str
+        self, messages: list[dict], model: str, max_tokens: int = 4096
     ) -> AsyncIterator[str]:
         """Stream from Ollama using its OpenAI-compatible endpoint."""
         try:
@@ -316,7 +338,7 @@ class LLMClient:
                 model=ollama_model,
                 messages=messages,  # type: ignore[arg-type]
                 temperature=self.temperature,
-                max_tokens=self.max_tokens,
+                max_tokens=max_tokens,
                 stream=True,
             )
             async for chunk in stream:

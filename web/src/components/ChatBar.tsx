@@ -9,6 +9,21 @@ import React, { useState, useRef } from 'react';
 import { useChat, useUI, useJob, useAppStore } from '../store/app';
 
 // ---------------------------------------------------------------------------
+// Benchmark model list — driven by VITE_BENCHMARK_MODELS env var.
+// Format: "model-id:Label,model-id:Label"
+// Empty or unset → dropdown hidden entirely.
+// ---------------------------------------------------------------------------
+const BENCHMARK_MODELS: { id: string; label: string }[] = (() => {
+  const raw = import.meta.env.VITE_BENCHMARK_MODELS ?? '';
+  if (!raw.trim()) return [];
+  return raw.split(',').flatMap((entry: string) => {
+    const [id, ...rest] = entry.trim().split(':');
+    if (!id) return [];
+    return [{ id: id.trim(), label: rest.join(':').trim() || id.trim() }];
+  });
+})();
+
+// ---------------------------------------------------------------------------
 // Impact Preview Modal (Sprint 4.1)
 // ---------------------------------------------------------------------------
 interface ImpactFile {
@@ -78,6 +93,10 @@ const ChatBar: React.FC = () => {
   // Edit agent state
   const editMode = useAppStore(s => s.editMode);
   const setEditMode = useAppStore(s => s.setEditMode);
+
+  // Chat mode: agent vs direct
+  const chatMode = useAppStore(s => s.chatMode);
+  const setChatMode = useAppStore(s => s.setChatMode);
   const agentSession = useAppStore(s => s.agentSession);
   const setAgentSession = useAppStore(s => s.setAgentSession);
   const setPendingApproval = useAppStore(s => s.setPendingApproval);
@@ -88,6 +107,7 @@ const ChatBar: React.FC = () => {
   const [inputValue, setInputValue] = useState('');
   const [shellUnrestricted, setShellUnrestricted] = useState(false);
   const [autoApprove, setAutoApprove] = useState(false);
+  const [selectedModel, setSelectedModel] = useState('');
   const abortRef = useRef<AbortController | null>(null);
   const sessionIdRef = useRef<string>(crypto.randomUUID());
   const [isAgentRunning, setIsAgentRunning] = useState(false);
@@ -128,6 +148,8 @@ const ChatBar: React.FC = () => {
           message: text,
           project_id: selectedProject?.id ?? null,
           session_id: sessionIdRef.current,
+          chat_mode: chatMode,
+          ...(selectedModel ? { model: selectedModel } : {}),
         }),
         signal: ctrl.signal,
       });
@@ -175,6 +197,11 @@ const ChatBar: React.FC = () => {
               continue;
             }
 
+            if (parsed.type === 'mode_note' && parsed.data) {
+              updateLastAssistantMessage(`\n\n> ⚡ *${parsed.data}*\n\n`);
+              continue;
+            }
+
             if (parsed.type === 'tool_thinking' && parsed.tool) {
               const label = toolThinkingLabel(parsed.tool, parsed.args ?? {});
               updateLastAssistantMessage(`\n\n> *${label}...*\n\n`);
@@ -186,8 +213,25 @@ const ChatBar: React.FC = () => {
               continue;
             }
 
-            if (parsed.type === 'tool_result') {
-              // Skip — tool results are for the LLM context, not chat display
+            if (parsed.type === 'tool_result' && parsed.tool) {
+              const res = parsed.result ?? '';
+              let summary = '';
+              if (res.startsWith('[Error:') || res.startsWith('Error:')) {
+                summary = `> ⚠️ *${parsed.tool} failed: ${res.slice(0, 120)}*\n\n`;
+              } else if (res.includes('is a directory')) {
+                summary = `> ⚠️ *Path is a directory — picking a file from listing...*\n\n`;
+              } else if (res === '' || res.startsWith('No matches found')) {
+                summary = `> ⚠️ *${parsed.tool}: no results*\n\n`;
+              } else {
+                const chars = res.length;
+                const matchCount = parsed.tool === 'search_files'
+                  ? (res.match(/\n/g)?.length ?? 0) + 1
+                  : null;
+                summary = matchCount !== null
+                  ? `> ✅ *Found ${matchCount} match${matchCount !== 1 ? 'es' : ''}*\n\n`
+                  : `> ✅ *Read ${chars.toLocaleString()} chars*\n\n`;
+              }
+              if (summary) updateLastAssistantMessage(summary);
               continue;
             }
 
@@ -477,7 +521,7 @@ const ChatBar: React.FC = () => {
       />
     )}
     <div className="chatbar">
-      {/* Mode toggle */}
+      {/* Mode toggle: Chat / Edit */}
       <div className="chatbar-mode-toggle">
         <button
           className={`chatbar-mode-btn${!editMode ? ' active' : ''}`}
@@ -494,6 +538,39 @@ const ChatBar: React.FC = () => {
           Edit
         </button>
       </div>
+
+      {/* Chat sub-mode: Agent / Direct (only visible in Chat mode) */}
+      {!editMode && (
+        <div className="chatbar-submode-toggle" title={chatMode === 'agent' ? 'Agent mode: LLM decides which files to read (better for smart models)' : 'Direct mode: Python pre-reads files, single LLM call (better for weaker models, faster)'}>
+          <button
+            className={`chatbar-submode-btn${chatMode === 'agent' ? ' active' : ''}`}
+            onClick={() => setChatMode('agent')}
+          >
+            Agent
+          </button>
+          <button
+            className={`chatbar-submode-btn${chatMode === 'direct' ? ' active' : ''}`}
+            onClick={() => setChatMode('direct')}
+          >
+            Direct
+          </button>
+        </div>
+      )}
+
+      {/* Model selector — only shown when VITE_BENCHMARK_MODELS is configured */}
+      {!editMode && BENCHMARK_MODELS.length > 0 && (
+        <select
+          className="chatbar-model-select"
+          value={selectedModel}
+          onChange={e => setSelectedModel(e.target.value)}
+          title="Override LLM model (empty = server default)"
+        >
+          <option value="">Default</option>
+          {BENCHMARK_MODELS.map(({ id, label }) => (
+            <option key={id} value={id}>{label}</option>
+          ))}
+        </select>
+      )}
 
       <span className="chatbar-context">
         {projectName ? `Context: ${projectName}` : 'No project'}

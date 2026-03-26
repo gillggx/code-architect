@@ -3,7 +3,7 @@
  */
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Folder, ArrowLeft, Wrench as BuildIcon, CheckCircle, Zap, RotateCcw, Sun, Moon } from 'lucide-react';
+import { Folder, ArrowLeft, Wrench as BuildIcon, CheckCircle, Zap, RotateCcw, RefreshCw, Sun, Moon } from 'lucide-react';
 import {
   useAppStore,
   AgentEvent,
@@ -179,6 +179,7 @@ const TopBar: React.FC = () => {
         } else if (event.type === 'skip') {
           addFileIfMissing(event.file);
           updateFileStatus(event.file, 'skipped');
+          incrementFilesAnalyzed();
         }
       }
 
@@ -439,6 +440,42 @@ const TopBar: React.FC = () => {
     }
   };
 
+  const handleForceAnalyze = async () => {
+    if (!selectedProject) return;
+    if (!window.confirm('Force full re-analysis? This will re-read all files and overwrite the current memory.')) return;
+    setIsSubmitting(true);
+    try {
+      const res = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_path: selectedProject.path }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({})) as { detail?: string };
+        throw new Error(body.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json() as { job_id: string; project_id: string };
+      const { job_id: jobId, project_id: projectId } = data;
+
+      clearEvents();
+      clearModules();
+      resetProgress();
+      fileListRef.current = [];
+      allPatternsRef.current = [];
+      setFileTree([]);
+      setPatterns([]);
+      setFreshnessStatus(null);
+
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${wsProtocol}://${window.location.host}/ws/analyze/${jobId}`);
+      setCurrentJob({ jobId, projectId, projectPath: selectedProject.path, status: 'running', ws });
+    } catch (err) {
+      console.error('Force re-analyze failed:', err);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   const handleAnalyze = async () => {
     const projectPath = inputPath.trim();
     if (!projectPath) { setModalError('Please enter a project path.'); return; }
@@ -554,6 +591,16 @@ const TopBar: React.FC = () => {
               title="只重新分析新增或變動的檔案"
             >
               <Zap size={12} style={{ marginRight: 3 }} />Refresh
+            </button>
+          )}
+          {appView === 'workspace' && selectedProject && (
+            <button
+              className="topbar-btn"
+              onClick={handleForceAnalyze}
+              disabled={isRunning || isSubmitting}
+              title="強制重新分析所有檔案（清除快取）"
+            >
+              <RefreshCw size={12} style={{ marginRight: 3 }} />Re-analyze
             </button>
           )}
           {appView === 'workspace' && (

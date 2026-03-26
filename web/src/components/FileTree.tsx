@@ -164,11 +164,11 @@ const FileTree: React.FC = () => {
                   <div className="progress-bar-fill" style={{ width: `${pct}%` }} />
                 </div>
                 <div className="progress-bar-label">
-                  {filesAnalyzed} / {filesTotal} analyzed ({pct}%)
+                  {filesAnalyzed} / {filesTotal} processed ({pct}%)
                 </div>
               </>
             ) : (
-              <span>{fileTree.filter(f => f.status === 'done' || f.status === 'skipped').length} / {total} analyzed</span>
+              <span>{fileTree.filter(f => f.status === 'done' || f.status === 'skipped').length} / {total} processed</span>
             )}
           </div>
         </>
